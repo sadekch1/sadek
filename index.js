@@ -795,6 +795,302 @@ async function extractOkruVideo(pageUrl) {
 }
 
 
+// ===== ⚽ .football — BEGIN (v116) =====
+// إعادة مباريات كرة القدم — مصادر: Footballzzz (قايمة اليوم) + footreplays (بديل)
+// + SoccerFull (m3u8 مباشر للمباراة الكاملة) + ok.ru (رفوعات كاملة بجودات وحجم)
+// ملاحظة: لا وقت انطلاق في أي مصدر (التاريخ فقط) — لا يُخترع وقت أبداً.
+// ولا نتائج/أهداف في أي رسالة (من غير حرق).
+const footballCache = new Map();
+const FOOTBALL_UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+const FOOTBALLZZZ_BASE = 'https://footballzzz.com';
+const FOOTREPLAYS_BASE = 'https://www.footreplays.com';
+const SOCCERFULL_BASE = 'https://soccerfull.net';
+const FOOTBALL_FULL_MIN_SEC = 3600; // أقل مدة تُعتبر مباراة كاملة (60 دقيقة)
+const FOOTBALL_MAX_DIRECT_BYTES = 2000 * 1048576; // حد واتساب 2GB — فوقه يروح .remotedl
+
+function footballTodayUTC() {
+    return new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+}
+
+function footballNorm(s) {
+    return String(s || '').toLowerCase().replace(/&amp;/g, '&').replace(/[^a-z0-9\u0600-\u06FF]+/g, ' ').trim().replace(/\s+/g, ' ');
+}
+
+function footballWords(s) {
+    return footballNorm(s).split(' ').filter(w => w.length > 1);
+}
+
+function footballHasTeam(text, team) {
+    const t = footballNorm(text);
+    return footballWords(team).every(w => t.includes(w));
+}
+
+function footballFmtDuration(sec) {
+    const m = Math.round(sec / 60);
+    return `${m} دقيقة`;
+}
+
+// ── Footballzzz: قايمة مباريات اليوم من الصفحة الرئيسية (server-rendered) ──
+async function footballFetchMatchesFootballzzz() {
+    const res = await axios.get(FOOTBALLZZZ_BASE + '/', { headers: { 'User-Agent': FOOTBALL_UA }, timeout: 25000 });
+    const html = res.data;
+    const today = footballTodayUTC();
+    const matches = [];
+    const cardRe = /<article[^>]*class="match-card"[^>]*>([\s\S]*?)<\/article>/g;
+    let m;
+    while ((m = cardRe.exec(html)) !== null) {
+        const card = m[1];
+        const linkM = card.match(/href="(\/replay\/[^"]+)"/);
+        const dateM = card.match(/datetime="(\d{4}-\d{2}-\d{2})/);
+        if (!linkM || !dateM || dateM[1] !== today) continue;
+        const leagueM = card.match(/comp-badge[^>]*>([^<]+)</);
+        const h3M = card.match(/<h3[^>]*>([\s\S]*?)<\/h3>/);
+        if (!h3M) continue;
+        const h3Text = h3M[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        const vsM = h3Text.match(/^(.+?)\s+vs\s+(.+)$/i);
+        if (!vsM) continue;
+        const stateM = card.match(/video-state[^>]*>(?:<span[^>]*>[\s\S]*?<\/span>)?\s*([^<]+)/);
+        const state = stateM ? stateM[1].trim() : '';
+        matches.push({
+            home: vsM[1].trim(), away: vsM[2].trim(),
+            league: leagueM ? leagueM[1].trim() : 'دوري',
+            ready: /full match/i.test(state),
+            url: FOOTBALLZZZ_BASE + linkM[1],
+            source: 'footballzzz'
+        });
+    }
+    return matches;
+}
+
+// ── footreplays: بديل لقايمة اليوم (روابط /بلد/دوري/فريق-ضد-فريق-DD-MM-YYYY/) ──
+async function footballFetchMatchesFootreplays() {
+    const res = await axios.get(FOOTREPLAYS_BASE + '/', { headers: { 'User-Agent': FOOTBALL_UA }, timeout: 25000 });
+    const html = res.data;
+    const today = footballTodayUTC(); // YYYY-MM-DD
+    const [y, mo, d] = today.split('-');
+    const todaySlug = `${d}-${mo}-${y}`; // DD-MM-YYYY كما في روابط footreplays
+    const leagueNames = { 'premier-league': 'Premier League', 'la-liga': 'La Liga', 'serie-a': 'Serie A', 'bundesliga': 'Bundesliga', 'ligue-1': 'Ligue 1', 'champions-league': 'Champions League', 'europa-league': 'Europa League', 'conference-league': 'Conference League' };
+    const matches = [];
+    const seen = new Set();
+    const aRe = /<a[^>]+href="(?:https?:\/\/www\.footreplays\.com)?(\/[^"]+?-\d{2}-\d{2}-\d{4}\/)"[^>]*>([\s\S]*?)<\/a>/g;
+    let m;
+    while ((m = aRe.exec(html)) !== null) {
+        const href = m[1];
+        if (!href.endsWith(todaySlug + '/')) continue;
+        if (seen.has(href)) continue;
+        seen.add(href);
+        const title = m[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        const vsM = title.match(/^(.+?)\s+vs\s+(.+)$/i);
+        if (!vsM) continue;
+        const parts = href.split('/').filter(Boolean);
+        const leagueSlug = parts.length > 1 ? parts[1] : '';
+        const league = leagueNames[leagueSlug] || (leagueSlug ? leagueSlug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) : 'دوري');
+        matches.push({ home: vsM[1].trim(), away: vsM[2].trim(), league, ready: true, url: FOOTREPLAYS_BASE + href, source: 'footreplays' });
+    }
+    return matches;
+}
+
+// ── قايمة اليوم: Footballzzz أولاً، وfootreplays بديل إن فشل أو رجّع صفر ──
+async function footballFetchTodayMatches() {
+    try {
+        const list = await footballFetchMatchesFootballzzz();
+        if (list.length) return { matches: list, source: 'footballzzz' };
+    } catch (_) {}
+    const list2 = await footballFetchMatchesFootreplays();
+    if (list2.length) return { matches: list2, source: 'footreplays' };
+    return { matches: [], source: 'footballzzz' };
+}
+
+// ── تحليل مدة قائمة m3u8 (مجموع #EXTINF) ──
+function footballM3u8Duration(text) {
+    let total = 0; let n = 0;
+    const re = /#EXTINF:(\d+(?:\.\d+)?)/g;
+    let m;
+    while ((m = re.exec(text)) !== null) { total += parseFloat(m[1]); n++; }
+    return n ? total : 0;
+}
+
+// ── حل رابط m3u8 نسبي مع الاحتفاظ ببارامترات الـ query (مثل token) من الرابط الأساسي ──
+function footballM3u8Url(uri, base) {
+    const u = new URL(uri, base);
+    const b = new URL(base);
+    if (!u.search && b.search) u.search = b.search;
+    return u.href;
+}
+
+async function footballM3u8DurationOf(url, refererUrl, depth = 0) {
+    const res = await axios.get(url, { headers: { 'User-Agent': FOOTBALL_UA, Referer: refererUrl || SOCCERFULL_BASE + '/' }, timeout: 30000 });
+    const text = String(res.data);
+    if (text.includes('#EXT-X-STREAM-INF') && depth < 1) {
+        const lines = text.split(/\r?\n/).map(l => l.trim());
+        for (let i = 0; i < lines.length; i++) {
+            if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+            for (let j = i + 1; j < lines.length; j++) {
+                if (!lines[j] || lines[j].startsWith('#')) continue;
+                return footballM3u8DurationOf(footballM3u8Url(lines[j], url), url, depth + 1);
+            }
+        }
+        return 0;
+    }
+    return footballM3u8Duration(text);
+}
+
+// ── تحليل master m3u8: الجودات + مدة أعلى جودة + حجم تقديري ──
+async function footballM3u8Info(masterUrl) {
+    const masterRes = await axios.get(masterUrl, { headers: { 'User-Agent': FOOTBALL_UA }, timeout: 25000 });
+    const master = String(masterRes.data);
+    const lines = master.split(/\r?\n/).map(l => l.trim());
+    const variants = [];
+    for (let i = 0; i < lines.length; i++) {
+        if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+        const inf = lines[i];
+        const bw = parseInt((inf.match(/AVERAGE-BANDWIDTH=(\d+)/) || inf.match(/BANDWIDTH=(\d+)/) || [])[1] || '0', 10) || 0;
+        const res = (inf.match(/RESOLUTION=(\d+x\d+)/) || [])[1] || '';
+        let uri = null;
+        for (let j = i + 1; j < lines.length; j++) {
+            if (!lines[j] || lines[j].startsWith('#')) continue;
+            uri = lines[j]; break;
+        }
+        if (!uri) continue;
+        variants.push({ bw, res, url: footballM3u8Url(uri, masterUrl) });
+    }
+    if (!variants.length) {
+        const dur = footballM3u8Duration(master);
+        if (!dur) return null;
+        return { label: 'HD', durationSec: dur, sizeBytes: null, variants: [{ bw: 0, res: '', url: masterUrl }] };
+    }
+    variants.sort((a, b) => b.bw - a.bw);
+    const best = variants[0];
+    const dur = await footballM3u8DurationOf(best.url, masterUrl);
+    if (!dur) return null;
+    const sizeBytes = best.bw > 0 ? Math.round(best.bw * dur / 8) : null;
+    const label = best.res ? `${best.res.split('x')[1]}p` : (best.bw ? `${Math.round(best.bw / 1000)} kbps` : 'HD');
+    return { label, durationSec: dur, sizeBytes, variants };
+}
+
+// ── SoccerFull: رابط m3u8 مباشر للمباراة الكاملة ──
+// الصفحة الرئيسية ← صفحة المباراة ← iframe /play/<id> ← رابط m3u8 مباشر
+async function footballResolveSoccerFull(match) {
+    const homePage = await axios.get(SOCCERFULL_BASE + '/', { headers: { 'User-Agent': FOOTBALL_UA }, timeout: 25000 });
+    const html = homePage.data;
+    const candidates = [];
+    const aRe = /<a[^>]+href="([^"]+\.html)"[^>]*>([\s\S]*?)<\/a>/g;
+    let m;
+    while ((m = aRe.exec(html)) !== null) {
+        const text = m[2].replace(/<[^>]+>/g, ' ');
+        if (footballHasTeam(text, match.home) && footballHasTeam(text, match.away)) {
+            const href = m[1].startsWith('http') ? m[1] : SOCCERFULL_BASE + (m[1].startsWith('/') ? m[1] : '/' + m[1]);
+            if (!candidates.includes(href)) candidates.push(href);
+        }
+        if (candidates.length >= 3) break;
+    }
+    if (!candidates.length) return null;
+    for (const matchUrl of candidates) {
+        try {
+            const pageRes = await axios.get(matchUrl, { headers: { 'User-Agent': FOOTBALL_UA, Referer: SOCCERFULL_BASE + '/' }, timeout: 25000 });
+            const playM = pageRes.data.match(/<iframe[^>]+src="((?:https?:\/\/soccerfull\.net)?\/play\/\d+)"/);
+            if (!playM) continue;
+            const playUrl = playM[1].startsWith('http') ? playM[1] : SOCCERFULL_BASE + playM[1];
+            const playRes = await axios.get(playUrl, { headers: { 'User-Agent': FOOTBALL_UA, Referer: matchUrl }, timeout: 25000 });
+            const m3u8M = String(playRes.data).match(/https?:\/\/[^\s"'<>]+\.m3u8(?:[^\s"'<>]*)?/);
+            if (!m3u8M) continue;
+            const masterUrl = m3u8M[0];
+            const info = await footballM3u8Info(masterUrl);
+            if (!info || info.durationSec < FOOTBALL_FULL_MIN_SEC) continue;
+            return { matchUrl, playUrl, m3u8Url: masterUrl, label: info.label, durationSec: info.durationSec, sizeBytes: info.sizeBytes, variants: info.variants };
+        } catch (_) { continue; }
+    }
+    return null;
+}
+
+// ── ok.ru: مدة + تاريخ رفع فيديو من صفحة الفيديو (meta duration + uploadDate) ──
+async function footballOkruMeta(videoId) {
+    try {
+        const res = await axios.get(`https://ok.ru/video/${videoId}`, { headers: OKRU_PAGE_HEADERS, timeout: 20000 });
+        const html = String(res.data);
+        const dM = html.match(/duration"\s*content="(\d+)"/);
+        const uM = html.match(/"uploadDate" content="([^"]+)"/) || html.match(/uploadDate[^0-9]{0,30}(20\d\d-\d\d-\d\d)/);
+        const uploadDate = uM ? new Date(uM[1]) : null;
+        return { durationSec: dM ? parseInt(dM[1], 10) : null, uploadDate: uploadDate && !isNaN(uploadDate) ? uploadDate : null };
+    } catch (_) { return { durationSec: null, uploadDate: null }; }
+}
+
+async function footballOkruDuration(videoId) {
+    const meta = await footballOkruMeta(videoId);
+    return meta.durationSec;
+}
+
+// ── حداثة الرفع: المباراة من قايمة اليوم، فالرفع لازم يكون حديث (آخر 7 أيام) ──
+// لو مفيش تاريخ رفع في الصفحة، نرفض العناوين اللي فيها سنة قديمة (< 2026)
+function footballOkruRecent(title, uploadDate) {
+    if (uploadDate) {
+        const ageMs = Date.now() - uploadDate.getTime();
+        return ageMs >= -86400000 && ageMs <= 7 * 86400000;
+    }
+    const years = String(title || '').match(/\b(19|20)\d\d\b/g) || [];
+    return !years.some(y => parseInt(y, 10) < 2026);
+}
+
+// ── حجم رابط مباشر عبر HEAD (Range bytes=0-0 — المجموع من Content-Range) ──
+async function footballHeadSize(url) {
+    try {
+        const res = await axios.head(url, {
+            headers: { 'User-Agent': WEB_UA, Range: 'bytes=0-0' },
+            timeout: 15000, maxRedirects: 5,
+            validateStatus: s => s >= 200 && s < 500
+        });
+        const cr = res.headers['content-range'] || '';
+        const crM = cr.match(/\/(\d+)\s*$/);
+        if (crM) return parseInt(crM[1], 10);
+        const len = parseInt(res.headers['content-length'] || '0', 10);
+        return len > 0 ? len : null;
+    } catch (_) { return null; }
+}
+
+// ── ok.ru: ابحث عن رفع كامل للمباراة (≥ 60 دقيقة) + أطول ملخص كبديل ──
+// يرجّع { full: {id,title,durationSec,qualities:[{name,label,url,sizeBytes}]} | null,
+//         highlights: {id,title,durationSec} | null }
+async function footballResolveOkruFull(home, away) {
+    const queries = [`${home} vs ${away} full match`, `${home} vs ${away}`];
+    const seen = new Set();
+    const candidates = [];
+    for (const q of queries) {
+        try {
+            const list = await okruSearchRaw(q);
+            for (const v of list) {
+                if (seen.has(v.id)) continue;
+                seen.add(v.id);
+                candidates.push(v);
+                if (candidates.length >= 8) break;
+            }
+        } catch (_) {}
+        if (candidates.length >= 8) break;
+    }
+    let highlights = null;
+    for (const c of candidates) {
+        const meta = await footballOkruMeta(c.id);
+        const dur = meta.durationSec;
+        if (!dur) continue;
+        if (!footballOkruRecent(c.title, meta.uploadDate)) continue; // رفع قديم (موسم سابق) — مش مباراة اليوم
+        if (dur >= FOOTBALL_FULL_MIN_SEC) {
+            try {
+                const { title, videos } = await extractOkruVideo(`https://ok.ru/video/${c.id}`);
+                const qualities = [];
+                const sized = await Promise.allSettled(videos.map(async v => {
+                    const url = String(v.url).replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+                    return { name: v.name, label: OKRU_QUALITY_LABELS[v.name] || v.name || 'غير معروفة', url, sizeBytes: await footballHeadSize(url) };
+                }));
+                for (const s of sized) if (s.status === 'fulfilled') qualities.push(s.value);
+                if (!qualities.length) continue;
+                return { full: { id: c.id, title, durationSec: dur, qualities }, highlights };
+            } catch (_) { continue; }
+        }
+        if (!highlights || dur > highlights.durationSec) highlights = { id: c.id, title: c.title, durationSec: dur };
+    }
+    return { full: null, highlights };
+}
+// ===== ⚽ .football — END (v116) =====
+
 function isHlsUrl(url) {
     return /\.m3u8(\?|$)/i.test(String(url || ''));
 }
@@ -4245,6 +4541,15 @@ async function startXeonBotInc() {
                         const qName = cached.names[idx];
                         qualityCache.delete(quotedId);
 
+                        // ── حجم أكبر من 2GB → لا تحميل مباشر ولا تمرير تلقائي؛ نطبع الرابط والحجم فقط والمستخدم يمرّره بنفسه لـ .remotedl ──
+                        if (cached.sizes && cached.sizes[idx] && cached.sizes[idx] > FOOTBALL_MAX_DIRECT_BYTES) {
+                            const bigUrl = cached.links[idx];
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `⚠️ *الحجم كبير جداً للتحميل المباشر!*\n📌 *العنوان:* ${cached.title || '-'}\n⚙️ *الجودة:* ${qName}\n⚖️ *الحجم:* ${fmtBytes(cached.sizes[idx])} (حد واتساب 2GB)\n\n🔗 *رابط التحميل المباشر:*\n${bigUrl}\n\n💡 مرّر الرابط بنفسك لأمر \`.remotedl\` مع حجم الجزء اللي تختاره (مثلاً 500 لأجزاء 500MB — ولازم يفضل أقل من 2000 لأن واتساب أقصى ملف 2GB).`
+                            }, { quoted: mek });
+                            return;
+                        }
+
                         const tmpDir = path.join(process.cwd(), 'dltmp');
                         if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
@@ -4311,7 +4616,7 @@ async function startXeonBotInc() {
 
                             await downloadVideoSmart(finalUrl, outPath, {
                                 'User-Agent': WEB_UA,
-                                'Referer': cached.referer || 'https://akwam.ss/',
+                                'Referer': (cached.referers && cached.referers[idx]) || cached.referer || 'https://akwam.ss/',
                                 ...(cached.headers || {})
                             });
                             if (cached.subtitleUrl) outPath = await muxSubtitleIntoMp4(outPath, cached.subtitleUrl);
@@ -4799,6 +5104,113 @@ async function startXeonBotInc() {
                             }
                             return;
                         }
+                    }
+
+                    // ── اختيار مباراة من قايمة .football recent ──
+                    if (footballCache.has(quotedId)) {
+                        const cached = footballCache.get(quotedId);
+                        const num = parseInt(String(replyText).trim());
+                        if (isNaN(num) || num < 1) {
+                            await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من القائمة.' }, { quoted: mek });
+                            return;
+                        }
+                        const match = cached.matches[num - 1];
+                        if (!match) {
+                            await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من القائمة.' }, { quoted: mek });
+                            return;
+                        }
+                        footballCache.delete(quotedId);
+                        const matchTitle = `${match.home} vs ${match.away}`;
+                        await XeonBotInc.sendMessage(chatId, {
+                            text: `⏳ جاري البحث عن المباراة الكاملة لـ\n*${matchTitle}*...`
+                        }, { quoted: mek });
+                        try {
+                            const [sf, ok] = await Promise.allSettled([
+                                footballResolveSoccerFull(match),
+                                footballResolveOkruFull(match.home, match.away)
+                            ]);
+                            const soccerFull = sf.status === 'fulfilled' ? sf.value : null;
+                            const okFull = ok.status === 'fulfilled' ? ok.value.full : null;
+                            const okHl = ok.status === 'fulfilled' ? ok.value.highlights : null;
+
+                            const options = [];
+                            if (soccerFull) {
+                                options.push({
+                                    label: `⚽ SoccerFull — ${soccerFull.label} (${footballFmtDuration(soccerFull.durationSec)})`,
+                                    url: soccerFull.m3u8Url, sizeBytes: soccerFull.sizeBytes,
+                                    referer: soccerFull.matchUrl
+                                });
+                            }
+                            if (okFull) {
+                                for (const q of okFull.qualities) {
+                                    options.push({
+                                        label: `📺 ok.ru — ${q.label}`,
+                                        url: q.url, sizeBytes: q.sizeBytes,
+                                        referer: 'https://ok.ru/'
+                                    });
+                                }
+                            }
+
+                            if (!options.length) {
+                                // لا تحميل مباشر للمباراة الكاملة — لينك مشاهدة + ملخص إن وُجد
+                                let msg = `⚠️ *المباراة الكاملة لسه مش متاحة للتحميل المباشر.*\n⚽ ${matchTitle}\n\n🎬 *شاهدها هنا:*\n${match.url}`;
+                                if (okHl) {
+                                    try {
+                                        const { title, videos } = await extractOkruVideo(`https://ok.ru/video/${okHl.id}`);
+                                        const qOpts = [];
+                                        const sized = await Promise.allSettled(videos.map(async v => {
+                                            const url = String(v.url).replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+                                            return { name: v.name, label: OKRU_QUALITY_LABELS[v.name] || v.name || 'غير معروفة', url, sizeBytes: await footballHeadSize(url) };
+                                        }));
+                                        for (const s of sized) if (s.status === 'fulfilled') qOpts.push(s.value);
+                                        if (qOpts.length) {
+                                            let qText = `${msg}\n\n🎞️ *الملخص متاح للتحميل (${footballFmtDuration(okHl.durationSec)}):*\n\n`;
+                                            qOpts.forEach((o, i) => { qText += `*${i + 1}* - 📺 ok.ru — ${o.label} — ${o.sizeBytes ? fmtBytes(o.sizeBytes) : 'الحجم غير معروف'}\n`; });
+                                            qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة المطلوبة.`;
+                                            const sentQ = await XeonBotInc.sendMessage(chatId, { text: qText }, { quoted: mek });
+                                            qualityCache.set(sentQ.key.id, {
+                                                links: qOpts.map(o => o.url),
+                                                names: qOpts.map(o => `📺 ok.ru — ${o.label}`),
+                                                sizes: qOpts.map(o => o.sizeBytes),
+                                                referers: qOpts.map(() => 'https://ok.ru/'),
+                                                title: `${matchTitle} — ملخص`,
+                                                referer: 'https://ok.ru/',
+                                                headers: {},
+                                                timestamp: Date.now()
+                                            });
+                                            setTimeout(() => qualityCache.delete(sentQ.key.id), 300000);
+                                            return;
+                                        }
+                                    } catch (_) {}
+                                }
+                                msg += `\n\n💡 جرّب تاني بعد شوية — الرفوعات الكاملة بتنزل بعد المباراة بساعات.`;
+                                await XeonBotInc.sendMessage(chatId, { text: msg }, { quoted: mek });
+                                return;
+                            }
+
+                            let qText = `🍿 *اختر جودة التحميل:*\n⚽ ${matchTitle}\n🎬 مباراة كاملة\n\n`;
+                            options.forEach((o, i) => {
+                                const sizeStr = o.sizeBytes ? fmtBytes(o.sizeBytes) : 'الحجم غير معروف';
+                                const big = o.sizeBytes && o.sizeBytes > FOOTBALL_MAX_DIRECT_BYTES ? ' ⚠️ فوق 2GB — تحميل عن بُعد' : '';
+                                qText += `*${i + 1}* - ${o.label} — ${sizeStr}${big}\n`;
+                            });
+                            qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة المطلوبة.`;
+                            const sentQ = await XeonBotInc.sendMessage(chatId, { text: qText }, { quoted: mek });
+                            qualityCache.set(sentQ.key.id, {
+                                links: options.map(o => o.url),
+                                names: options.map(o => o.label),
+                                sizes: options.map(o => o.sizeBytes),
+                                referers: options.map(o => o.referer),
+                                title: `${matchTitle} — Full Match`,
+                                referer: options[0].referer || 'https://footballzzz.com/',
+                                headers: {},
+                                timestamp: Date.now()
+                            });
+                            setTimeout(() => qualityCache.delete(sentQ.key.id), 300000);
+                        } catch (err) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل جلب المباراة:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
                     }
 
                     // ── اختيار أنمي/حلقة من نتائج .anime (متعدد المصادر) ──
@@ -5513,6 +5925,7 @@ async function startXeonBotInc() {
                     text.startsWith('.batchdl') ||
                     text.startsWith('.apk') ||
                     text.startsWith('.anime') ||
+                    text.startsWith('.football') ||
                     text.startsWith('.setanime') ||
                     text.startsWith('.animeset') ||
                     text.startsWith('.cartoon') ||
@@ -5562,78 +5975,109 @@ async function startXeonBotInc() {
 
                     // ── أمر .help — عرض كل أوامر البوت مع الشرح ──
                     if (command === '.help') {
-                        await XeonBotInc.sendMessage(chatId, { text: `🤖 *أوامر البوت*
+                        await XeonBotInc.sendMessage(chatId, { text: `🤖 *بوت صادق — كل الأوامر*
 
-🎬 *أنمي:*
-• .anime <اسم> — بحث وتحميل أنمي عربي (15 مصدر)
-• .setanime <مصدر> — تثبيت مصدر واحد (أو all للكل)
-• .animeapi — فحص حالة مصادر الأنمي
+✨ *ازاي تستخدم البوت؟ (4 خطوات)*
+1️⃣ اكتب أمر بحث — مثال: \`.anime ناروتو\`
+2️⃣ البوت هيبعتلك قائمة مرقّمة — *رد (Reply)* على رسالته برقم اللي عايزه
+3️⃣ لو أنمي/مسلسل: رد برقم الحلقة، أو بمدى زي \`1-15\` لتحميل كذا حلقة مرة واحدة
+4️⃣ رد برقم الجودة اللي عايزها — والبوت هيحمّل ويبعتلك الفيديو
+⏰ *مهم:* الرد لازم يكون خلال *5 دقايق* من رسالة البوت، وإلا عيد البحث من الأول
 
-📺 *كرتون:*
-• .cartoon <اسم> — كرتون مدبلج عربي (7 مصادر)
-• .setcartoon <مصدر> — تثبيت مصدر واحد
-• .cartoonapi — فحص مصادر الكرتون
-• .cartoon-en <اسم> — كرتون إنجليزي (4 مصادر)
-• .setcartoon-en <مصدر> — تثبيت مصدر واحد
-• .cartoon-enapi — فحص مصادر الكرتون الإنجليزي
+🎬 *أنمي — عربي ومترجم (15 مصدر)*
+• \`.anime <اسم>\` — ابحث وحمّل أي أنمي
+  ↳ مثال: \`.anime ناروتو\` أو \`.anime Naruto\`
+• \`.setanime <مصدر>\` — ثبّت مصدر واحد يبحث فيه بس، وبدّله لما يقع
+  ↳ مثال: \`.setanime okru\` — وارجع للكل بـ \`.setanime all\`
+• \`.animeapi\` — شوف حالة مصادر الأنمي (شغال ولا واقع)
 
-🇰🇷 *دراما كورية:*
-• .kdrama <اسم> — مسلسلات كورية مدبلجة/مترجمة (6 مصادر)
-• .setkdrama <مصدر> — تثبيت مصدر واحد
-• .kdramaapi — فحص مصادر الدراما
+📺 *كرتون مدبلج عربي (7 مصادر)*
+• \`.cartoon <اسم>\` — ابحث وحمّل كرتون مدبلج
+  ↳ مثال: \`.cartoon بن تن\` أو \`.cartoon سيف النار\`
+• \`.setcartoon <مصدر>\` — ثبّت مصدر واحد للكرتون
+  ↳ مثال: \`.setcartoon stardima\` — وارجع للكل بـ \`.setcartoon all\`
+• \`.cartoonapi\` — شوف حالة مصادر الكرتون
 
-🎥 *أفلام ومسلسلات:*
-• .movie <اسم> — بحث وتحميل أفلام عربية مترجمة
-• .series <اسم> — بحث وتحميل مسلسلات
-• .setmv <مصدر> — تثبيت مصدر واحد
-• .mvapi — فحص مصادر الأفلام والمسلسلات
+🌍 *كرتون إنجليزي (4 مصادر)*
+• \`.cartoon-en <اسم>\` — كرتون إنجليزي كلاسيكي
+  ↳ مثال: \`.cartoon-en Tom and Jerry\` أو \`.cartoon-en Ben 10\`
+• \`.setcartoon-en <مصدر>\` — ثبّت مصدر واحد للكرتون الإنجليزي
+• \`.cartoon-enapi\` — شوف حالة مصادر الكرتون الإنجليزي
 
-📖 *مانجا وفيديو:*
-• .manga <اسم> — بحث وتحميل مانجا
-• .okru <اسم> — تحميل فيديو من ok.ru
-• .m3u8 <رابط> — تحميل فيديو من رابط m3u8/HLS (بأجزاء إن كان كبيراً)
+🇰🇷 *دراما كورية (6 مصادر)*
+• \`.kdrama <اسم>\` — مسلسلات كورية مدبلجة/مترجمة
+  ↳ مثال: \`.kdrama لعبة الحبار\` أو \`.kdrama squid game\`
+• \`.setkdrama <مصدر>\` — ثبّت مصدر واحد للدراما
+• \`.kdramaapi\` — شوف حالة مصادر الدراما
 
-⬇️ *تحميل:*
-• .download <رابط> — تحميل مباشر (يدعم Google Drive)
-• .batchdl — تحميل عدة روابط من ملف txt مرفق
-• .remotedl <رابط> — تحميل عن بُعد عبر GitHub Actions
-• .setremotedl — ضبط مستودع ورمز التحميل عن بُعد
-• .stopremotedl — إلغاء تحميل عن بُعد نشط
-• .cleanremote — حذف إصدارات التحميل عن بُعد من GitHub
+🎥 *أفلام ومسلسلات (8 مصادر)*
+• \`.movie <اسم>\` — ابحث وحمّل فيلم مترجم
+  ↳ مثال: \`.movie breaking bad\`
+• \`.series <اسم>\` — ابحث وحمّل مسلسل (حلقات + مدى حلقات)
+  ↳ مثال: \`.series breaking bad\`
+• \`.setmv <مصدر>\` — ثبّت مصدر واحد للأفلام والمسلسلات
+• \`.mvapi\` — شوف حالة مصادر الأفلام والمسلسلات
 
-▶️ *يوتيوب:*
-• .ytdl <رابط> [جودة] — تحميل فيديو يوتيوب
-• .ytlive <رابط> [دقائق] [جودة] — تسجيل بث مباشر
-• .ytsearch <كلمات> — بحث في يوتيوب بدون تحميل
-• .ytgo — تأكيد التحميل / بدء التسجيل
-• .ytno — إلغاء الطلب
-• .stopytdl — إيقاف تحميل أو تسجيل يوتيوب
+⚽ *كورة — إعادة مباريات*
+• \`.football recent\` — مباريات اليوم من كل الدوريات (من غير حرق)
+  ↳ مثال: \`.football recent\` — رد برقم المباراة لعرض الجودات والحجم قبل التحميل
+  ↳ لو الحجم فوق 2GB البوت هيطبع لك الرابط والحجم، وتمرّره بنفسك لـ \`.remotedl\` مع حجم الجزء اللي تختاره
 
-📺 *قنوات IPTV:*
-• .setm3u <رابط> — تعيين قائمة M3U
-• .m3usource — عرض قنوات مصدر M3U الحالي
-• .seturl <رابط> — تحديث رابط M3U بعد التجديد
-• .channels <اسم> — بحث عن قناة في القائمة
-• .iptv <اسم> — بحث في قائمة iptv-org الثابتة
-• .test — اختبار سيرفر IPTV
-• .playm3u <رابط> [المدة] — تشغيل قناة
-• .stopplaym3u — إيقاف التشغيل
-• .record <معرّف> [دقائق] — تسجيل قناة من القائمة
-• .stoprecord — إيقاف التسجيل
-• .recordiptv <معرّف> [دقائق] — تسجيل من iptv-org
-• .stoprecordiptv — إيقاف تسجيل IPTV
+📖 *مانجا وفيديو*
+• \`.manga <اسم>\` — ابحث وحمّل مانجا (رد برقم الفصل، أو بمدى زي \`1 5\`)
+  ↳ مثال: \`.manga naruto\` أو \`.manga بلاك كلوفر\`
+• \`.okru <رابط>\` — حمّل فيديو من ok.ru
+  ↳ مثال: \`.okru https://ok.ru/video/123456789\`
+• \`.m3u8 <رابط>\` — حمّل فيديو من رابط m3u8/HLS (بأجزاء إن كان كبيراً)
+  ↳ مثال: \`.m3u8 https://example.com/playlist.m3u8\`
 
-📱 *أدوات:*
-• .apk <اسم> — بحث وتحميل تطبيق APK
-• .sh <أمر> — تنفيذ أمر شل (للمالك فقط)
-• .cwd — عرض مجلد العمل الحالي
-• .killcmd — إيقاف الأمر الجاري
-• .ping — فحص أن البوت شغال
-• .help — عرض هذه القائمة
+⬇️ *تحميل*
+• \`.download <رابط>\` — تحميل مباشر (يدعم Google Drive)
+  ↳ مثال: \`.download <رابط الفيديو المباشر>\`
+• \`.batchdl\` — حمّل عدة روابط مرة واحدة: أرفق ملف txt (رابط في كل سطر) واكتب \`.batchdl\` كتعليق عليه
+• \`.remotedl <رابط> [حجم الجزء]\` — تحميل عن بُعد عبر GitHub Actions (للملفات الكبيرة)
+• \`.setremotedl <owner/repo> <توكن>\` — ضبط مستودع ورمز التحميل عن بُعد
+• \`.stopremotedl\` — إلغاء تحميل عن بُعد شغال
+• \`.cleanremote\` — حذف إصدارات التحميل عن بُعد من GitHub
 
-💡 *ملاحظات:*
-• بعد اختيار أنمي/فيلم/مسلسل، رد برقم الحلقة أو بمدى مثل 1-15
-• الرد على قوائم البوت خلال 5 دقائق` }, { quoted: mek });
+▶️ *يوتيوب*
+• \`.ytdl <رابط> [جودة]\` — حمّل فيديو يوتيوب (الجودة: audio أو 360/480/720/1080)
+  ↳ مثال: \`.ytdl https://youtu.be/xxxx 480\`
+• \`.ytlive <رابط> [دقائق] [جودة]\` — سجّل بث مباشر من يوتيوب (مقاطع متواصلة)
+  ↳ مثال: \`.ytlive https://youtube.com/watch?v=xxxx 120 480\`
+• \`.ytsearch [عدد] <كلمات>\` — ابحث في يوتيوب من غير تحميل
+  ↳ مثال: \`.ytsearch 8 شرح البرمجة بايثون\`
+• \`.ytgo\` — تأكيد التحميل / بدء التسجيل بعد ما البوت يسألك
+• \`.ytno\` — إلغاء الطلب
+• \`.stopytdl\` — إيقاف تحميل أو تسجيل يوتيوب شغال
+
+📺 *قنوات IPTV*
+• \`.setm3u <رابط>\` — عيّن قائمة M3U الخاصة بيك
+  ↳ مثال: \`.setm3u https://example.com/playlist.m3u\`
+• \`.m3usource\` — اعرض قنوات مصدر M3U الحالي
+• \`.seturl <رابط>\` — حدّث رابط M3U بعد التجديد
+• \`.channels <اسم>\` — ابحث عن قناة في قائمتك (وهات الـ ID بتاعها)
+  ↳ مثال: \`.channels الجزيرة\`
+• \`.iptv <اسم>\` — ابحث في قائمة iptv-org الثابتة
+• \`.test\` — اختبر سيرفر IPTV شغال ولا لأ
+• \`.playm3u <رابط> [المدة]\` — شغّل قناة من رابط m3u/m3u8
+  ↳ مثال: \`.playm3u https://example.com/stream.m3u8 60\`
+• \`.stopplaym3u\` — إيقاف التشغيل
+• \`.record <ID> [دقائق]\` — سجّل قناة من قائمتك (مقاطع متواصلة)
+  ↳ مثال: \`.record 1234 120\` — هات الـ ID من \`.channels\`
+• \`.stoprecord\` — إيقاف التسجيل
+• \`.recordiptv <ID> [دقائق]\` — سجّل من قائمة iptv-org
+  ↳ مثال: \`.recordiptv 1234 120\` — هات الـ ID من \`.iptv\`
+• \`.stoprecordiptv\` — إيقاف تسجيل IPTV
+
+📱 *أدوات*
+• \`.apk <اسم>\` — ابحث وحمّل تطبيق APK
+  ↳ مثال: \`.apk mt manager\`
+• \`.sh <أمر>\` — نفّذ أمر شل (للمالك فقط)
+• \`.cwd\` — اعرض مجلد العمل الحالي
+• \`.killcmd\` — أوقف الأمر الجاري
+• \`.ping\` — افحص إن البوت شغال (بيرد Pong + زمن الرد)
+• \`.help\` — اعرض هذه القائمة` }, { quoted: mek });
                         return;
                     }
 
@@ -7459,6 +7903,41 @@ async function startXeonBotInc() {
                             setTimeout(() => animeCache.delete(sentMsg.key.id), 300000);
                         } catch (err) {
                             await XeonBotInc.sendMessage(chatId, { text: `❌ فشل البحث:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
+                    // ── أمر .football — إعادة مباريات اليوم ──
+                    if (command === '.football') {
+                        const sub = (query || '').split(/\s+/)[0].toLowerCase();
+                        if (!query || sub !== 'recent') {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: '⚽ *أمر .football — إعادة مباريات كرة القدم*\n\n• `.football recent` — مباريات اليوم من كل الدوريات (من غير حرق: لا نتائج ولا أهداف)\n  ↳ رد برقم المباراة لعرض الجودات والحجم قبل التحميل\n\n💡 *مثال:* `.football recent`'
+                            }, { quoted: mek });
+                            return;
+                        }
+                        try {
+                            await XeonBotInc.sendMessage(chatId, { text: '⏳ جاري جلب مباريات اليوم...' }, { quoted: mek });
+                            const { matches, source } = await footballFetchTodayMatches();
+                            if (!matches.length) throw new Error('لا توجد مباريات اليوم في المصادر المتاحة حالياً. جرّب لاحقاً.');
+                            const shown = matches.slice(0, 30);
+                            const dateStr = new Date().toLocaleDateString('ar-EG', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Africa/Cairo' });
+                            let responseText = `⚽ *مباريات اليوم — ${dateStr}*\n\n`;
+                            let lastLeague = null;
+                            shown.forEach((mt, i) => {
+                                if (mt.league !== lastLeague) {
+                                    lastLeague = mt.league;
+                                    responseText += `🏆 *${mt.league}*\n`;
+                                }
+                                responseText += `*${i + 1}* - ${mt.home} 🆚 ${mt.away} ${mt.ready ? '✅' : '⏳'}\n`;
+                            });
+                            responseText += `\n✅ = الإعادة جاهزة • ⏳ = لسه منزلتش\n💡 رد (Reply) على هذه الرسالة برقم المباراة لعرض الجودات والحجم قبل التحميل.\n⏰ الرد لازم يكون خلال *5 دقايق*.`;
+                            if (matches.length > 30) responseText += `\n\n📌 عرض أول 30 مباراة من ${matches.length}.`;
+                            const sentMsg = await XeonBotInc.sendMessage(chatId, { text: responseText }, { quoted: mek });
+                            footballCache.set(sentMsg.key.id, { matches: shown, timestamp: Date.now() });
+                            setTimeout(() => footballCache.delete(sentMsg.key.id), 300000);
+                        } catch (err) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل جلب مباريات اليوم:\n\`${err.message}\`` }, { quoted: mek });
                         }
                         return;
                     }
