@@ -59,7 +59,8 @@ const RECORD_DEFAULT_SEGMENT_MIN = 6; // احتياطي إذا فشل فحص م�
 const RECORD_SEGMENT_SAFETY_BYTES = 180 * 1024 * 1024; // حد أمان 180 ميجا للجزء الواحد (أقل من مساحة القرص المتاحة)
 
 // فحص معدل بت البث الفعلي عبر ffprobe لحساب مدة جزء تعطي ~100 ميجا بدقة أعلى
-function probeStreamBitrate(streamUrl) {
+// headersStr اختياري (CRLF-separated) لبثات تتطلب Referer/Origin مثل مصادر .livefootball
+function probeStreamBitrate(streamUrl, headersStr = null) {
     return new Promise((resolve) => {
         let settled = false;
         const finish = (val) => { if (!settled) { settled = true; resolve(val); } };
@@ -70,6 +71,7 @@ function probeStreamBitrate(streamUrl) {
             '-show_format',
             '-analyzeduration', '4000000',
             '-probesize', '4000000',
+            ...(headersStr ? ['-headers', headersStr] : []),
             streamUrl
         ];
         const proc = spawn('ffprobe', args);
@@ -110,6 +112,8 @@ async function recordContinuousSegmented(streamUrl, segDir, prefix, totalDuratio
     const pattern = path.join(segDir, `${prefix}_%03d.mp4`);
     const args = [
         '-y',
+        // هيدرات اختيارية من control.streamHeaders (لبثات .livefootball التي تتطلب Referer/Origin)
+        ...(control && control.streamHeaders ? ['-headers', control.streamHeaders] : []),
         '-i', streamUrl,
         '-t', String(totalDurationSec),
         '-c', 'copy',
@@ -202,6 +206,9 @@ const activeRecordings = new Map(); // chatId -> { proc, cancelled }
 
 // ── تتبع التسجيلات النشطة الخاصة بقائمة IPTV الثابتة فقط (منفصل عن UGEEN) ──
 const activeIptvRecordings = new Map(); // chatId -> { proc, cancelled }
+
+// ── تتبع تسجيلات .livefootball النشطة (منفصل عن .record/.recordiptv) ──
+const activeLiveFootballRecordings = new Map(); // chatId -> { proc, cancelled, streamHeaders }
 
 const UGEEN_CONFIG = {
     host: "https://ugeen.live",
@@ -1358,6 +1365,487 @@ async function footballResolveMixDrop(match) {
     return { mp4Url, sizeBytes: finalSize, durationSec: durationSec || null, cookie, eUrl, fUrl };
 }
 // ===== ⚽ .football — END (v117) =====
+
+// ===== ⚽ .livefootball — BEGIN =====
+// تسجيل مباريات مباشرة من مصادر بث رياضي مجمّعة (قائمة المستخدم)، بنفس منطق .record:
+// فحص معدل البت → تسجيل متواصل مُجزّأ (~100MB للجزء) باتصال واحد → إرسال كل جزء فور
+// اكتماله → إعادة اتصال تلقائية (مع إعادة استخراج رابط البث لأن توكنات m3u8 قصيرة العمر)
+// → إيقاف بـ .stoplivefootball (خريطة تتبع منفصلة عن .record/.recordiptv).
+const LF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const liveFootballLists = new Map(); // chatId -> { matches, at }
+
+// سجل المصادر: auto=true يعني أن للبوت جالب أحداث تلقائياً لهذا المصدر.
+// الباقي مصادر معروفة الدومين (قائمة FMHY الحالية) تُستخدم عبر الوضع المباشر:
+// .livefootball <رابط صفحة المباراة من المصدر> [دقائق]
+const LF_SOURCES = [
+    { key: 'damitv', name: 'DamiTV', auto: true },
+    { key: 'daddylive', name: 'DaddyLive', auto: true },
+    { key: 'ppv', name: 'PPV.ST', auto: true },
+    { key: 'sportsbite', name: 'SportsBite', auto: true },
+    { key: 'fctv33', name: 'FCTV33', auto: true },
+    { key: 'watchsports', name: 'WatchSports', auto: true },
+    { key: 'roxie', name: 'RoxieStreams', auto: true },
+    { key: 'strmfree', name: 'StreamFree', auto: true },
+    { key: 'thetvapp', name: 'TheTVApp', auto: true },
+    { key: 'timstreams', name: 'TimStreams', url: 'https://tim-streams.com' },
+    { key: 'zlive', name: 'zlive', url: 'https://zlive.st' },
+    { key: 'streameast', name: 'StreamEast', url: 'https://streameast.ga' },
+    { key: 'streamcorner', name: 'StreamCorner', url: 'https://streamcorner.st' },
+    { key: 'streamsports99', name: 'StreamSports99', url: 'https://streamsports99.ru' },
+    { key: 'daddylivehd', name: 'DaddyLiveHD', url: 'https://daddylive.mov' },
+    { key: 'strumyk', name: 'Strumyk / Strims24', url: 'https://strumyk.pk' },
+    { key: 'totalsportek', name: 'TotalSportek / Sportsurge.st', url: 'https://totalsport-ek.st' },
+    { key: 'sportsurge', name: 'Sportsurge', url: 'https://v2.sportsurge.net' },
+    { key: 'sportontv', name: 'SportOnTV', url: 'https://sportontv.click' },
+    { key: 'vipleague', name: 'VIP Box Sports', url: 'https://vipleague.me' },
+    { key: 'crichd', name: 'CricHD', url: 'https://crichd.at' },
+    { key: 'livetv', name: 'LiveTV', url: 'https://livetv.sx' },
+    { key: 'futbolx', name: 'Futbol-X', url: 'https://www.futbol-x.xyz' },
+    { key: 'aurasports', name: 'AURA Sports', url: 'https://aurasports.xyz' },
+    { key: 'cinevid', name: 'Cinevid', url: 'https://cinevid.st' },
+    { key: 'bintv', name: 'BINTV', url: 'https://www.bintv.cc' },
+    { key: 'ntv', name: 'NTV', url: 'https://ntv.st' },
+    { key: 'reedstreams', name: 'Reedstreams', url: 'https://reedstreams.to' },
+    { key: 'xyzstreams', name: 'xyzstreams', url: 'https://xyzstreams.st' },
+    { key: 'matchora', name: 'Matchora', url: 'https://matchora.to' },
+    { key: 'tap4sport', name: 'Tap4Sport', url: 'https://tap4sport.st' },
+    { key: 'streami', name: 'Streami', url: 'https://streamic.st' },
+    { key: 'falconstreams', name: 'FalconStreams', url: 'https://falconstreams.app' },
+    { key: 'fctv33b', name: 'FCTV33 (mirror)', url: 'https://www.fctv33go.hair' },
+    { key: 'fawanews', name: 'FawaNews', url: 'https://www.fawanews.sc' },
+];
+
+async function lfGet(url, timeoutMs = 20000) {
+    const res = await axios.get(url, {
+        headers: { 'User-Agent': LF_UA, 'Accept': 'text/html,application/json,*/*' },
+        timeout: timeoutMs, maxRedirects: 5, validateStatus: s => s >= 200 && s < 400
+    });
+    return res.data;
+}
+
+function lfDecodeEntities(s) {
+    return String(s || '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"').replace(/&#0?39;|&apos;/g, "'").replace(/&nbsp;/g, ' ');
+}
+
+// استخراج روابط <a> من HTML: [{title, url}] بعد حلّ الروابط النسبية وتنظيف النص
+function lfParseAnchors(html, baseUrl) {
+    const out = [];
+    const seen = new Set();
+    const re = /<a\s[^>]*href\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    while ((m = re.exec(String(html || ''))) !== null) {
+        const rawHref = lfDecodeEntities(m[1]).trim();
+        if (!rawHref || /^(#|javascript:|mailto:)/i.test(rawHref)) continue;
+        let abs;
+        try { abs = new URL(rawHref, baseUrl).toString(); } catch (_) { continue; }
+        if (seen.has(abs)) continue;
+        const title = lfDecodeEntities(m[2].replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
+        if (title.length < 4) continue;
+        seen.add(abs);
+        out.push({ title, url: abs });
+    }
+    return out;
+}
+
+// أول رابط m3u8 في نص/HTML (مع حلّه مقابل baseUrl إن كان نسبياً)
+function lfExtractM3u8(text, baseUrl) {
+    const m = String(text || '').match(/https?:\/\/[^\s"'<>\\]+?\.m3u8(?:\?[^\s"'<>\\]*)?/i)
+        || String(text || '').match(/[^\s"'<>\\]+?\.m3u8(?:\?[^\s"'<>\\]*)?/i);
+    if (!m) return null;
+    try { return new URL(m[0], baseUrl).toString(); } catch (_) { return null; }
+}
+
+function lfIframeSrcs(html, baseUrl) {
+    const out = [];
+    const re = /<iframe\s[^>]*src\s*=\s*["']([^"']+)["']/gi;
+    let m;
+    while ((m = re.exec(String(html || ''))) !== null) {
+        try { out.push(new URL(lfDecodeEntities(m[1]).trim(), baseUrl).toString()); } catch (_) {}
+    }
+    return out;
+}
+
+// ── DamiTV: API عام موثّق — GET ondemand.st/papi/api/streams ──
+// يعيد فئات → بثوث فيها teams وstarts_at وstatus ومصفوفة sources وحقل iframe (صفحة embed).
+async function lfFetchDamitv() {
+    const data = await lfGet('https://ondemand.st/papi/api/streams', 25000);
+    const root = (data && (data.data || data.streams || data.categories)) || data;
+    const out = [];
+    const walk = (node, category) => {
+        if (!node || typeof node !== 'object') return;
+        if (Array.isArray(node)) { node.forEach(n => walk(n, category)); return; }
+        const cat = node.name && (node.streams || node.events) ? node.name : category;
+        const title = node.title || node.name;
+        const teams = node.teams;
+        const teamTitle = teams
+            ? (Array.isArray(teams) ? teams.map(t => t.name || t).filter(Boolean).join(' vs ')
+                : [teams.home, teams.away].filter(Boolean).join(' vs ') || [teams.home_team, teams.away_team].filter(Boolean).join(' vs '))
+            : '';
+        const embed = node.iframe || node.embed || node.embed_url || null;
+        if (embed && (teamTitle || title)) {
+            const catText = footballNorm([cat, node.category, node.sport, node.league].filter(Boolean).join(' '));
+            const isFootball = !catText || /football|soccer/.test(catText);
+            if (isFootball) {
+                out.push({
+                    title: teamTitle || String(title),
+                    source: 'DamiTV',
+                    pageUrl: String(embed),
+                    status: node.status || null,
+                    startsAt: node.starts_at || node.start_time || null
+                });
+            }
+        }
+        for (const v of Object.values(node)) if (v && typeof v === 'object') walk(v, cat);
+    };
+    walk(root, '');
+    const seen = new Set();
+    return out.filter(x => !seen.has(x.pageUrl) && seen.add(x.pageUrl)).slice(0, 40);
+}
+
+// ── DaddyLive (DLHD): الصفحة الرئيسية = جدول أحداث + قنوات ──
+// صفحات المشغّل على نمط /{stream|watch|player|cast}/stream-{id}.php
+async function lfFetchDaddyLive() {
+    let html = null, base = null;
+    for (const cand of ['https://dlive.sx/', 'https://daddylive.pk/']) {
+        try { html = await lfGet(cand, 25000); base = cand; break; } catch (_) {}
+    }
+    if (!html) throw new Error('تعذر الوصول إلى DaddyLive');
+    return lfParseAnchors(html, base)
+        .filter(a => /stream-\d+\.php/i.test(a.url))
+        .map(a => ({ title: a.title, source: 'DaddyLive', pageUrl: a.url, status: null, startsAt: null }))
+        .slice(0, 40);
+}
+
+// ── PPV.ST: روابط أحداث حية على نمط /live/{sport}/{date}/{slug} ──
+async function lfFetchPpv() {
+    const html = await lfGet('https://ppv.st/', 25000);
+    return lfParseAnchors(html, 'https://ppv.st/')
+        .filter(a => /\/live\/(football|soccer)\//i.test(a.url))
+        .map(a => ({ title: a.title, source: 'PPV.ST', pageUrl: a.url, status: null, startsAt: null }))
+        .slice(0, 40);
+}
+
+// ── جالب عام لصفحات أحداث/كرة قدم عند مجمّعات أخرى ──
+async function lfFetchGeneric(sourceName, pageUrl, hrefFilter) {
+    const html = await lfGet(pageUrl, 25000);
+    return lfParseAnchors(html, pageUrl)
+        .filter(a => hrefFilter(a))
+        .map(a => ({ title: a.title, source: sourceName, pageUrl: a.url, status: null, startsAt: null }))
+        .slice(0, 40);
+}
+
+const LF_FETCHERS = [
+    lfFetchDamitv,
+    lfFetchDaddyLive,
+    lfFetchPpv,
+    () => lfFetchGeneric('SportsBite', 'https://sportsbite.org/sport/football', a => /football|soccer|match|watch|stream/i.test(a.url)),
+    () => lfFetchGeneric('FCTV33', 'https://www.fctv33go.autos/football.html', a => !/\.html?$/i.test(new URL(a.url).pathname) || /football|match|live/i.test(a.url)),
+    () => lfFetchGeneric('WatchSports', 'https://watchsports.su/', a => /\/football\//i.test(a.url)),
+    () => lfFetchGeneric('RoxieStreams', 'https://roxiestreams.su/', a => /football|soccer/i.test(a.title + ' ' + a.url)),
+    () => lfFetchGeneric('StreamFree', 'https://strmfree.pk/', a => /football|soccer|match|live|watch/i.test(a.title + ' ' + a.url)),
+    () => lfFetchGeneric('TheTVApp', 'https://thetvapp.plus/', a => /soccer|football/i.test(a.title + ' ' + a.url)),
+];
+
+// جلب أحداث كل المصادر التلقائية بالتوازي — فشل مصدر لا يوقف الباقي
+async function lfFetchAllEvents() {
+    const results = await Promise.allSettled(LF_FETCHERS.map(f => f()));
+    const all = [];
+    const failed = [];
+    results.forEach((r, i) => {
+        if (r.status === 'fulfilled') all.push(...r.value);
+        else failed.push(LF_SOURCES[i] ? LF_SOURCES[i].name : `مصدر ${i + 1}`);
+    });
+    const seen = new Set();
+    const deduped = all.filter(x => {
+        const k = footballNorm(x.title) + '|' + x.source;
+        if (seen.has(k) || !x.title) return false;
+        seen.add(k); return true;
+    });
+    return { matches: deduped.slice(0, 30), failed };
+}
+
+// ── استخراج رابط البث الفعلي (m3u8) من صفحة مباراة/مشغّل ──
+// يتبع iframes حتى مستويين، ويعيد الهيدرات اللازمة (Referer/Origin/User-Agent).
+async function lfResolveStream(pageUrl) {
+    if (isHlsUrl(pageUrl)) {
+        return { streamUrl: pageUrl, headers: { 'User-Agent': LF_UA, Referer: pageUrl } };
+    }
+    const queue = [{ url: pageUrl, depth: 0 }];
+    const visited = new Set();
+    while (queue.length) {
+        const { url, depth } = queue.shift();
+        if (visited.has(url)) continue;
+        visited.add(url);
+        let html;
+        try { html = await lfGet(url, 25000); } catch (_) { continue; }
+        if (typeof html !== 'string') continue;
+        const direct = lfExtractM3u8(html, url);
+        if (direct) {
+            let origin = '';
+            try { origin = new URL(url).origin; } catch (_) {}
+            return { streamUrl: direct, headers: { 'User-Agent': LF_UA, Referer: url, ...(origin ? { Origin: origin } : {}) } };
+        }
+        if (depth < 2) {
+            for (const f of lfIframeSrcs(html, url)) {
+                if (/player|embed|stream|watch|cast/i.test(f) || isHlsUrl(f)) queue.push({ url: f, depth: depth + 1 });
+            }
+        }
+    }
+    throw new Error('لم يتم العثور على رابط بث (m3u8) داخل صفحة المباراة. جرّب رابطاً مباشراً أو مصدراً آخر.');
+}
+
+function lfHeadersString(headers) {
+    return Object.entries(headers || {})
+        .filter(([k, v]) => v !== undefined && v !== null && !/^:/.test(k))
+        .map(([k, v]) => `${k}: ${v}`).join('\r\n');
+}
+
+// ── جودات البث من قائمة m3u8 رئيسية (Master Playlist) ──
+// يعيد [{height, bandwidth, url}] مرتبة تصاعدياً، أو [] إن لم تكن القائمة رئيسية.
+async function lfFetchVariants(streamUrl, headers) {
+    try {
+        const res = await axios.get(streamUrl, {
+            headers: { 'User-Agent': LF_UA, ...(headers || {}) },
+            timeout: 20000, responseType: 'text', validateStatus: s => s >= 200 && s < 400
+        });
+        const text = String(res.data || '');
+        if (!/#EXT-X-STREAM-INF/.test(text)) return [];
+        const lines = text.split(/\r?\n/);
+        const variants = [];
+        for (let i = 0; i < lines.length; i++) {
+            if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+            const resM = lines[i].match(/RESOLUTION=(\d+)x(\d+)/i);
+            const bwM = lines[i].match(/BANDWIDTH=(\d+)/i);
+            let uri = null;
+            for (let j = i + 1; j < lines.length; j++) {
+                const l = lines[j].trim();
+                if (!l) continue;
+                if (l.startsWith('#')) break;
+                uri = l; break;
+            }
+            if (!uri) continue;
+            let abs;
+            try { abs = new URL(uri, streamUrl).toString(); } catch (_) { continue; }
+            variants.push({
+                height: resM ? parseInt(resM[2]) : 0,
+                width: resM ? parseInt(resM[1]) : 0,
+                bandwidth: bwM ? parseInt(bwM[1]) : 0,
+                url: abs
+            });
+        }
+        variants.sort((a, b) => (a.height - b.height) || (a.bandwidth - b.bandwidth));
+        return variants;
+    } catch (_) { return []; }
+}
+
+// اختيار أقرب جودة مطلوبة: الأعلى التي لا تتجاوز المطلوب، وإلا الأقرب فوقه
+function lfPickVariant(variants, qualityHeight) {
+    if (!variants || !variants.length) return null;
+    const sorted = [...variants].sort((a, b) => a.height - b.height);
+    let best = null;
+    for (const v of sorted) if (v.height && v.height <= qualityHeight) best = v;
+    if (best) return best;
+    return sorted.find(v => v.height >= qualityHeight) || sorted[sorted.length - 1];
+}
+
+// طلبات .livefootball بانتظار اختيار الجودة بالرد (Reply) — مثل qualityCache
+const liveFootballQualityCache = new Map(); // sentMsgId -> job
+
+// بدء التسجيل الفعلي — نفس منطق .record (فحص بت، أجزاء ~100MB، إعادة اتصال مع إعادة استخراج)
+async function lfStartRecording(XeonBotInc, chatId, mek, job) {
+    if (activeLiveFootballRecordings.has(chatId)) {
+        await XeonBotInc.sendMessage(chatId, {
+            text: `⚠️ يوجد تسجيل مباراة نشط بالفعل في هذه المحادثة. أوقفه أولاً بأمر \`.stoplivefootball\` قبل بدء تسجيل جديد.`
+        }, { quoted: mek });
+        return;
+    }
+
+    const duration = job.duration;
+    const manualSegmentMinutes = job.manualSegmentMinutes;
+    const totalDurationSec = duration * 60;
+
+    const tmpDir = path.join(process.cwd(), 'dltmp');
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+
+    let segmentTimeSec;
+    let segmentMinutes;
+    let bitrateNote = '';
+
+    if (manualSegmentMinutes !== null && manualSegmentMinutes !== undefined) {
+        segmentMinutes = manualSegmentMinutes;
+        segmentTimeSec = manualSegmentMinutes * 60;
+    } else {
+        await XeonBotInc.sendMessage(chatId, {
+            text: `🔍 جاري فحص معدل بت البث لتقدير حجم الجزء بدقة (~${RECORD_TARGET_MB} MB)...`
+        }, { quoted: mek });
+
+        const bitrate = await probeStreamBitrate(job.streamUrl, lfHeadersString(job.headers));
+        segmentTimeSec = computeSegmentTimeSec(bitrate);
+        segmentMinutes = Math.round(segmentTimeSec / 60);
+
+        bitrateNote = bitrate
+            ? `\n📊 معدل البت المُقاس: ~${(bitrate / 1000000).toFixed(2)} Mbps`
+            : `\n⚠️ تعذر قياس معدل البت، تم استخدام تقدير احتياطي (${RECORD_DEFAULT_SEGMENT_MIN} دقائق)`;
+    }
+
+    const segDir = path.join(tmpDir, `livefb_${Date.now()}`);
+    fs.mkdirSync(segDir, { recursive: true });
+
+    const qualityNote = job.qualityLabel ? `\n🎞️ الجودة: *${job.qualityLabel}*` : '';
+    await XeonBotInc.sendMessage(chatId, {
+        text: `🎙️ *بدأ تسجيل المباراة المباشرة!*\n⚽ ${job.title}\n📡 المصدر: ${job.source}${qualityNote}\n⏱️ المدة الكلية: *${duration} دقيقة*\n📦 كل جزء: *~${segmentMinutes} دقيقة* (تقدير لـ ~${RECORD_TARGET_MB} MB)${bitrateNote}\n🔗 اتصال واحد متواصل بالبث — بدون أي انقطاع بين الأجزاء\n\n🛑 لإلغاء التسجيل في أي وقت: \`.stoplivefootball\``
+    }, { quoted: mek });
+
+    const control = { proc: null, cancelled: false, streamHeaders: lfHeadersString(job.headers) };
+    activeLiveFootballRecordings.set(chatId, control);
+
+    const MAX_RECONNECT_ATTEMPTS = 15;
+
+    (async () => {
+        let segmentIndex = 0;
+        let abortedBySize = false;
+        let wasCancelled = false;
+        let remainingSec = totalDurationSec;
+        let attempt = 0;
+        let reconnectedCount = 0;
+        let curStreamUrl = job.streamUrl;
+
+        const onSegmentReady = async (filePath) => {
+            segmentIndex++;
+            try {
+                const sizeMB = (fs.statSync(filePath).size / 1024 / 1024).toFixed(2);
+                await XeonBotInc.sendMessage(chatId, {
+                    document: { url: filePath },
+                    mimetype: 'video/mp4',
+                    fileName: `LiveFootball_part${segmentIndex}.mp4`,
+                    caption: `📦 *الجزء ${segmentIndex}*\n⚽ ${job.title}\n📡 ${job.source}${job.qualityLabel ? `\n🎞️ ${job.qualityLabel}` : ''}\n⚖️ ${sizeMB} MB`
+                }, { quoted: mek });
+            } catch (e) {
+                await XeonBotInc.sendMessage(chatId, {
+                    text: `⚠️ فشل إرسال الجزء ${segmentIndex}: ${e.message}`
+                }, { quoted: mek });
+            } finally {
+                try { fs.unlinkSync(filePath); } catch (_) {}
+            }
+        };
+
+        try {
+            while (remainingSec > 60 && attempt < MAX_RECONNECT_ATTEMPTS && !control.cancelled) {
+                attempt++;
+                const startTs = Date.now();
+
+                // إعادة استخراج الرابط عند كل إعادة اتصال (التوكنات قصيرة العمر)، مع إعادة اختيار نفس الجودة
+                if (attempt > 1 && job.pageUrl && !isHlsUrl(job.pageUrl)) {
+                    try {
+                        const re = await lfResolveStream(job.pageUrl);
+                        job.headers = re.headers;
+                        control.streamHeaders = lfHeadersString(re.headers);
+                        if (job.qualityHeight) {
+                            const vs = await lfFetchVariants(re.streamUrl, re.headers);
+                            const picked = lfPickVariant(vs, job.qualityHeight);
+                            curStreamUrl = picked ? picked.url : re.streamUrl;
+                        } else {
+                            curStreamUrl = re.streamUrl;
+                        }
+                        console.log('[LIVEFOOTBALL] stream re-resolved for reconnect attempt ' + attempt);
+                    } catch (e) {
+                        console.log('[LIVEFOOTBALL] re-resolve failed: ' + e.message);
+                    }
+                }
+
+                const result = await recordContinuousSegmented(
+                    curStreamUrl, segDir, `part_a${attempt}`, remainingSec, segmentTimeSec,
+                    onSegmentReady, control
+                );
+
+                const elapsedSec = Math.floor((Date.now() - startTs) / 1000);
+                remainingSec -= elapsedSec;
+
+                abortedBySize = result.abortedBySize;
+                wasCancelled = result.cancelled;
+
+                if (wasCancelled || abortedBySize) break;
+                if (remainingSec <= 60) break;
+
+                reconnectedCount++;
+                const backoffMs = Math.min(3000 * Math.pow(2, Math.min(reconnectedCount - 1, 5)), 60000);
+                await XeonBotInc.sendMessage(chatId, {
+                    text: `⚠️ *انقطع الاتصال بالبث بشكل غير متوقع.*\n⏱️ الوقت المتبقي: ~${Math.ceil(remainingSec / 60)} دقيقة\n🔄 جاري إعادة الاتصال (وإعادة استخراج الرابط) بعد ${Math.round(backoffMs / 1000)} ثانية... (محاولة ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS})`
+                }, { quoted: mek });
+                await new Promise(r => setTimeout(r, backoffMs));
+            }
+
+            if (!wasCancelled && !abortedBySize && attempt >= MAX_RECONNECT_ATTEMPTS && remainingSec > 60) {
+                await XeonBotInc.sendMessage(chatId, {
+                    text: `❌ تعذر إكمال التسجيل بعد ${MAX_RECONNECT_ATTEMPTS} محاولات إعادة اتصال. قد يكون مصدر البث غير مستقر حالياً — جرّب مصدراً آخر من القائمة.`
+                }, { quoted: mek });
+            }
+        } catch (err) {
+            await XeonBotInc.sendMessage(chatId, {
+                text: `❌ خطأ في التسجيل: ${err.message}`
+            }, { quoted: mek });
+        } finally {
+            activeLiveFootballRecordings.delete(chatId);
+            try { fs.rmSync(segDir, { recursive: true, force: true }); } catch (_) {}
+        }
+
+        if (wasCancelled) {
+            await XeonBotInc.sendMessage(chatId, {
+                text: `🛑 *تم إلغاء تسجيل المباراة بطلبك.*\n📦 عدد الأجزاء المُرسلة قبل الإلغاء: ${segmentIndex}`
+            }, { quoted: mek });
+        } else if (abortedBySize) {
+            await XeonBotInc.sendMessage(chatId, {
+                text: `🛑 *تم إيقاف التسجيل مبكراً!*\nجودة البث كانت أعلى من المتوقع وتجاوز حجم أحد الأجزاء الحد الآمن للتخزين المتاح.\n📦 عدد الأجزاء المُرسلة قبل التوقف: ${segmentIndex}\n\n💡 جرّب تقليل مدة الجزء أو اختيار جودة أقل في المرة القادمة.`
+            }, { quoted: mek });
+        } else {
+            const reconnectNote = reconnectedCount > 0 ? `\n🔄 حدثت ${reconnectedCount} إعادة اتصال بسبب انقطاعات مؤقتة في البث.` : '';
+            await XeonBotInc.sendMessage(chatId, {
+                text: `✅ *اكتمل تسجيل المباراة!*\n⚽ ${job.title}\n📦 عدد الأجزاء المُرسلة: ${segmentIndex}${reconnectNote}`
+            }, { quoted: mek });
+        }
+    })();
+}
+
+// بوابة بدء التسجيل مع اختيار الجودة:
+// - جودة محددة صراحة (720p) → اختيارها مباشرة.
+// - عدة جودات وبدون تحديد → إرسال قائمة والانتظار رداً برقم (liveFootballQualityCache).
+// - جودة واحدة أو لا قائمة رئيسية → البدء كما هي.
+async function lfBeginRecording(XeonBotInc, chatId, mek, job) {
+    const variants = await lfFetchVariants(job.streamUrl, job.headers);
+
+    if (variants.length > 1) {
+        if (job.requestedQuality) {
+            const picked = lfPickVariant(variants, job.requestedQuality);
+            if (picked) {
+                job.streamUrl = picked.url;
+                job.qualityHeight = picked.height;
+                job.qualityLabel = picked.height ? `${picked.height}p` : 'غير معروفة';
+            }
+            await lfStartRecording(XeonBotInc, chatId, mek, job);
+            return;
+        }
+
+        let qText = `🎞️ *اختر جودة التسجيل:*\n⚽ ${job.title}\n📡 ${job.source}\n\n`;
+        variants.forEach((v, i) => {
+            const bw = v.bandwidth ? ` — ~${(v.bandwidth / 1000000).toFixed(1)} Mbps` : '';
+            qText += `*${i + 1}.* ${v.height ? v.height + 'p' : 'جودة ' + (i + 1)}${v.width && v.height ? ` (${v.width}x${v.height})` : ''}${bw}\n`;
+        });
+        qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة خلال 5 دقائق.\nℹ️ كلما زادت الجودة زاد حجم كل جزء وقلّت مدته تلقائياً (~${RECORD_TARGET_MB} MB للجزء).`;
+        const sentQ = await XeonBotInc.sendMessage(chatId, { text: qText }, { quoted: mek });
+        liveFootballQualityCache.set(sentQ.key.id, { ...job, variants });
+        setTimeout(() => liveFootballQualityCache.delete(sentQ.key.id), 300000);
+        return;
+    }
+
+    if (variants.length === 1) {
+        job.streamUrl = variants[0].url;
+        job.qualityHeight = variants[0].height || null;
+        job.qualityLabel = variants[0].height ? `${variants[0].height}p (المتاحة فقط)` : null;
+    }
+    await lfStartRecording(XeonBotInc, chatId, mek, job);
+}
+// ===== ⚽ .livefootball — END (helpers) =====
 
 function isHlsUrl(url) {
     return /\.m3u8(\?|$)/i.test(String(url || ''));
@@ -5414,6 +5902,25 @@ async function startXeonBotInc() {
                         }
                     }
 
+                    // ── اختيار جودة تسجيل .livefootball ──
+                    if (liveFootballQualityCache.has(quotedId)) {
+                        const cached = liveFootballQualityCache.get(quotedId);
+                        const idx = parseInt(replyText) - 1;
+                        if (!cached.variants || !cached.variants[idx]) {
+                            await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من قائمة الجودات.' }, { quoted: mek });
+                            return;
+                        }
+                        const chosen = cached.variants[idx];
+                        liveFootballQualityCache.delete(quotedId);
+                        const job = { ...cached };
+                        delete job.variants;
+                        job.streamUrl = chosen.url;
+                        job.qualityHeight = chosen.height || null;
+                        job.qualityLabel = chosen.height ? `${chosen.height}p` : 'غير معروفة';
+                        await lfStartRecording(XeonBotInc, chatId, mek, job);
+                        return;
+                    }
+
                     // ── اختيار مباراة من قايمة .football recent ──
                     if (footballCache.has(quotedId)) {
                         const cached = footballCache.get(quotedId);
@@ -6270,6 +6777,8 @@ async function startXeonBotInc() {
                     text.startsWith('.iptv') ||
                     text.startsWith('.recordiptv') ||
                     text.startsWith('.stoprecordiptv') ||
+                    text.startsWith('.livefootball') ||
+                    text.startsWith('.stoplivefootball') ||
                     text.startsWith('.m3u') ||
                     text.startsWith('.record') ||
                     text.startsWith('.stoprecord') ||
@@ -6391,6 +6900,12 @@ async function startXeonBotInc() {
 • \`.recordiptv <ID> [دقائق]\` — سجّل من قائمة iptv-org
   ↳ مثال: \`.recordiptv 1234 120\` — هات الـ ID من \`.iptv\`
 • \`.stoprecordiptv\` — إيقاف تسجيل IPTV
+• \`.livefootball\` — مباريات مباشرة/قادمة من مصادر البث الرياضي (DaddyLive, DamiTV, PPV.ST...)
+  ↳ \`.livefootball <فريق>\` للبحث، ثم \`.livefootball <رقم> [دقائق]\` للتسجيل بنفس منطق \`.record\`
+  ↳ بعد اختيار المباراة يعرض البوت *قائمة الجودات* المتاحة (360p/480p/720p/1080p...) — رد برقم الجودة ليبدأ التسجيل
+  ↳ أو حدّد الجودة مباشرة واختصر الخطوة: \`.livefootball 1 120 720p\`
+  ↳ أو \`.livefootball <رابط صفحة مباراة أو m3u8> [دقائق]\` — و \`.livefootball sources\` لعرض المصادر
+• \`.stoplivefootball\` — إيقاف تسجيل مباراة مباشرة
 
 📱 *أدوات*
 • \`.apk <اسم>\` — ابحث وحمّل تطبيق APK
@@ -6920,6 +7435,157 @@ async function startXeonBotInc() {
                                 }, { quoted: mek });
                             }
                         })();
+                        return;
+                    }
+
+                    // ── أمر .stoplivefootball ──
+                    if (command === '.stoplivefootball') {
+                        const control = activeLiveFootballRecordings.get(chatId);
+                        if (!control) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `ℹ️ لا يوجد تسجيل مباراة مباشرة نشط حالياً في هذه المحادثة.`
+                            }, { quoted: mek });
+                            return;
+                        }
+                        control.cancelled = true;
+                        await XeonBotInc.sendMessage(chatId, {
+                            text: `🛑 جاري إلغاء تسجيل المباراة... سيتم إرسال الجزء الحالي (إن اكتمل) ثم التوقف.`
+                        }, { quoted: mek });
+                        return;
+                    }
+
+                    // ── أمر .livefootball — مباريات مباشرة من مصادر البث الرياضي، بنفس منطق .record ──
+                    // .livefootball                      → قائمة المباريات من المصادر التلقائية
+                    // .livefootball <فريق>               → بحث داخل القائمة
+                    // .livefootball <رقم> [دقائق] [جزء]  → تسجيل مباراة من آخر قائمة
+                    // .livefootball <رابط> [دقائق] [جزء] → تسجيل من صفحة مباراة/رابط m3u8 مباشر (لأي مصدر)
+                    // .livefootball sources              → عرض سجل المصادر
+                    if (command === '.livefootball') {
+                        if ((args[1] || '').toLowerCase() === 'sources') {
+                            let msg = `📡 *مصادر .livefootball (${LF_SOURCES.length} مصدر):*\n\n✅ *بحث تلقائي عن المباريات:*\n`;
+                            for (const s of LF_SOURCES.filter(x => x.auto)) msg += `• ${s.name}\n`;
+                            msg += `\n🔗 *تعمل بالرابط المباشر* (\`.livefootball <رابط صفحة المباراة>\`):\n`;
+                            for (const s of LF_SOURCES.filter(x => !x.auto)) msg += `• ${s.name}\n`;
+                            await XeonBotInc.sendMessage(chatId, { text: msg }, { quoted: mek });
+                            return;
+                        }
+
+                        const isUrlArg = !!args[1] && /^https?:\/\//i.test(args[1]);
+                        const isPickArg = !!args[1] && /^\d+$/.test(args[1]) && liveFootballLists.has(chatId);
+
+                        // وضع القائمة/البحث (بدون رقم اختيار وبدون رابط)
+                        if (!isUrlArg && !isPickArg) {
+                            if (!!args[1] && /^\d+$/.test(args[1])) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `ℹ️ اعرض قائمة المباريات أولاً بأمر \`.livefootball\` ثم اختر برقم: \`.livefootball <رقم> [دقائق]\``
+                                }, { quoted: mek });
+                                return;
+                            }
+                            try {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: query ? `🔍 جاري البحث عن مباريات *${query}* في مصادر البث المباشر...` : `📡 جاري جلب مباريات كرة القدم من مصادر البث المباشر...`
+                                }, { quoted: mek });
+                                const { matches, failed } = await lfFetchAllEvents();
+                                let filtered = query
+                                    ? matches.filter(mt => footballHasTeam(mt.title, query) || footballNorm(mt.title).includes(footballNorm(query)))
+                                    : matches;
+                                filtered = filtered.slice(0, 20);
+                                if (!filtered.length) {
+                                    await XeonBotInc.sendMessage(chatId, {
+                                        text: query ? `❌ لم يتم العثور على مباريات تطابق: *${query}* في المصادر حالياً.` : `❌ لم يتم العثور على مباريات متاحة في المصادر حالياً.`
+                                    }, { quoted: mek });
+                                    return;
+                                }
+                                liveFootballLists.set(chatId, { matches: filtered, at: Date.now() });
+                                let msg = `⚽ *مباريات كرة القدم (${filtered.length}):*\n\n`;
+                                filtered.forEach((mt, i) => {
+                                    const meta = [mt.source, mt.status, mt.startsAt].filter(Boolean).join(' • ');
+                                    msg += `*${i + 1}.* ${mt.title}\n📡 ${meta}\n\n`;
+                                });
+                                if (failed.length) msg += `⚠️ تعذر جلب: ${failed.join('، ')}\n\n`;
+                                msg += `▶️ للتسجيل: \`.livefootball [رقم] [المدة بالدقائق]\` — مثال: \`.livefootball 1 120\`\n⏱️ المدة الافتراضية إن لم تحددها: 120 دقيقة`;
+                                await XeonBotInc.sendMessage(chatId, { text: msg }, { quoted: mek });
+                            } catch (e) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `❌ خطأ في جلب المباريات:\n\`${e.message}\``
+                                }, { quoted: mek });
+                            }
+                            return;
+                        }
+
+                        // وضع التسجيل (اختيار من قائمة أو رابط مباشر) — نفس منطق .record
+                        // وسيط جودة اختياري على نمط 720p قد يأتي في أي موضع بعد الرقم/الرابط
+                        let requestedQuality = null;
+                        const lfTail = [];
+                        for (const a of args.slice(2)) {
+                            const qm = String(a).match(/^(\d{3,4})p$/i);
+                            if (qm && !requestedQuality) requestedQuality = parseInt(qm[1]);
+                            else lfTail.push(a);
+                        }
+                        let lfTitle, lfSource, lfPageUrl;
+                        let lfDurationArg, lfSegArg;
+                        if (isPickArg) {
+                            const list = liveFootballLists.get(chatId).matches;
+                            const pick = parseInt(args[1]);
+                            if (pick < 1 || pick > list.length) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `❌ الرقم يجب أن يكون بين 1 و ${list.length}.`
+                                }, { quoted: mek });
+                                return;
+                            }
+                            const chosen = list[pick - 1];
+                            lfTitle = chosen.title; lfSource = chosen.source; lfPageUrl = chosen.pageUrl;
+                            lfDurationArg = lfTail[0]; lfSegArg = lfTail[1];
+                        } else {
+                            lfPageUrl = args[1];
+                            lfTitle = 'مباراة مباشرة';
+                            try { lfSource = new URL(lfPageUrl).hostname; } catch (_) { lfSource = 'رابط مباشر'; }
+                            lfDurationArg = lfTail[0]; lfSegArg = lfTail[1];
+                        }
+
+                        const duration = lfDurationArg && !isNaN(parseInt(lfDurationArg)) ? parseInt(lfDurationArg) : 120;
+                        const manualSegmentMinutes = lfSegArg && !isNaN(parseInt(lfSegArg)) ? parseInt(lfSegArg) : null;
+
+                        if (duration < 1 || duration > 360) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `❌ المدة يجب أن تكون بين 1 و 360 دقيقة.`
+                            }, { quoted: mek });
+                            return;
+                        }
+                        if (manualSegmentMinutes !== null && (manualSegmentMinutes < 1 || manualSegmentMinutes > duration)) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `❌ مدة الجزء يجب أن تكون بين 1 دقيقة والمدة الكلية.`
+                            }, { quoted: mek });
+                            return;
+                        }
+
+                        if (activeLiveFootballRecordings.has(chatId)) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `⚠️ يوجد تسجيل مباراة نشط بالفعل في هذه المحادثة. أوقفه أولاً بأمر \`.stoplivefootball\` قبل بدء تسجيل جديد.`
+                            }, { quoted: mek });
+                            return;
+                        }
+
+                        let streamUrl, streamHeaders;
+                        try {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `🔎 جاري استخراج رابط البث من *${lfSource}*...`
+                            }, { quoted: mek });
+                            const resolved = await lfResolveStream(lfPageUrl);
+                            streamUrl = resolved.streamUrl;
+                            streamHeaders = resolved.headers;
+                        } catch (e) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `❌ فشل استخراج البث:\n\`${e.message}\``
+                            }, { quoted: mek });
+                            return;
+                        }
+
+                        await lfBeginRecording(XeonBotInc, chatId, mek, {
+                            title: lfTitle, source: lfSource, pageUrl: lfPageUrl,
+                            streamUrl, headers: streamHeaders,
+                            duration, manualSegmentMinutes, requestedQuality
+                        });
                         return;
                     }
 
