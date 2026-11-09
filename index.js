@@ -1100,7 +1100,7 @@ async function footballResolveOkruFull(home, away) {
 // الرابط فيه توكن s= وتاريخ انتهاء e= (صلاحية ~6 ساعات) — يُجلب طازج كل مرة.
 // التوكن مربوط بالجلسة/الـ IP اللي جابه، فلازم الحل والتحميل يكونوا من نفس
 // الجهاز (نفس تشغيل البوت) — الكوكيز بتتمرّر مع رابط التحميل في headerSets.
-const MIXDROP_UA = WEB_UA;
+const MIXDROP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'; // نفس WEB_UA (معرّف في سطر 1634) — قيمة حرفية عشان سطر 1103 بيتنفذ قبله
 
 // ── jar كوكيز بسيط للـ MixDrop: host -> {name: value} ──
 function footballMixDropJarStore(jar, url, setCookie) {
