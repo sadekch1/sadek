@@ -41,6 +41,7 @@ const { rmSync, existsSync } = require('fs')
 const { join } = require('path')
 const { randomBytes } = require('crypto')
 const crypto = require('crypto')
+const vm = require('vm') // فك الـ packed JS بتاع MixDrop (v117)
 
 // ── وحدة مشغّل m3u المستقلة (أوامر .playm3u / .stopplaym3u فقط) ──
 const m3uPlayer = require('./lib/m3uplayer')
@@ -795,9 +796,10 @@ async function extractOkruVideo(pageUrl) {
 }
 
 
-// ===== ⚽ .football — BEGIN (v116) =====
+// ===== ⚽ .football — BEGIN (v117) =====
 // إعادة مباريات كرة القدم — مصادر: Footballzzz (قايمة اليوم) + footreplays (بديل)
 // + SoccerFull (m3u8 مباشر للمباراة الكاملة) + ok.ru (رفوعات كاملة بجودات وحجم)
+// + MixDrop (mp4 مباشر من fullmatchshows) — v117
 // ملاحظة: لا وقت انطلاق في أي مصدر (التاريخ فقط) — لا يُخترع وقت أبداً.
 // ولا نتائج/أهداف في أي رسالة (من غير حرق).
 const footballCache = new Map();
@@ -805,6 +807,8 @@ const FOOTBALL_UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTM
 const FOOTBALLZZZ_BASE = 'https://footballzzz.com';
 const FOOTREPLAYS_BASE = 'https://www.footreplays.com';
 const SOCCERFULL_BASE = 'https://soccerfull.net';
+const FULLMATCHSHOWS_BASE = 'https://fullmatchshows.com';
+const FOOTBALL_LIST_SOURCE_LABEL = { footballzzz: 'Footballzzz', footreplays: 'footreplays' }; // وسم مصدر القايمة (v117)
 const FOOTBALL_FULL_MIN_SEC = 3600; // أقل مدة تُعتبر مباراة كاملة (60 دقيقة)
 const FOOTBALL_MAX_DIRECT_BYTES = 2000 * 1048576; // حد واتساب 2GB — فوقه يروح .remotedl
 
@@ -1089,7 +1093,180 @@ async function footballResolveOkruFull(home, away) {
     }
     return { full: null, highlights };
 }
-// ===== ⚽ .football — END (v116) =====
+// ── MixDrop (v117): مباراة كاملة mp4 من fullmatchshows ──
+// السلسلة: fullmatchshows (بحث ووردبريس ← صفحة المباراة) ← mixdrop.top/f/<id>
+// ← صفحة التشغيل mxdrop.click/e/<id> ← فك packed JS ← MDCore.wurl
+// ← mp4 مباشر على *.mxcontent.net (لازم كوكيز صفحة التشغيل + Referer وإلا 403).
+// الرابط فيه توكن s= وتاريخ انتهاء e= (صلاحية ~6 ساعات) — يُجلب طازج كل مرة.
+// التوكن مربوط بالجلسة/الـ IP اللي جابه، فلازم الحل والتحميل يكونوا من نفس
+// الجهاز (نفس تشغيل البوت) — الكوكيز بتتمرّر مع رابط التحميل في headerSets.
+const MIXDROP_UA = WEB_UA;
+
+// ── jar كوكيز بسيط للـ MixDrop: host -> {name: value} ──
+function footballMixDropJarStore(jar, url, setCookie) {
+    if (!setCookie || !setCookie.length) return;
+    let host;
+    try { host = new URL(url).hostname; } catch (_) { return; }
+    jar[host] = jar[host] || {};
+    for (const sc of setCookie) {
+        const m = String(sc).match(/^\s*([^=;]+)=([^;]*)/);
+        if (m) jar[host][m[1].trim()] = m[2].trim();
+    }
+}
+
+function footballMixDropJarHeader(jar, url) {
+    let host;
+    try { host = new URL(url).hostname; } catch (_) { return ''; }
+    const parts = [];
+    for (const [h, cookies] of Object.entries(jar)) {
+        if (host === h || host.endsWith('.' + h)) {
+            for (const [k, v] of Object.entries(cookies)) parts.push(`${k}=${v}`);
+        }
+    }
+    return parts.join('; ');
+}
+
+// ── GET مع تتبع يدوي للتحويلات وجمع الكوكيز من كل خطوة (axios مش بيحتفظ بكوكيز) ──
+async function footballMixDropGet(url, jar, extraHeaders = {}) {
+    let cur = url;
+    for (let hop = 0; hop < 6; hop++) {
+        const headers = { 'User-Agent': MIXDROP_UA, ...extraHeaders };
+        const ck = footballMixDropJarHeader(jar, cur);
+        if (ck) headers.Cookie = ck;
+        const res = await axios.get(cur, {
+            headers, timeout: 25000, maxRedirects: 0,
+            validateStatus: s => s >= 200 && s < 400
+        });
+        footballMixDropJarStore(jar, cur, res.headers['set-cookie']);
+        if ([301, 302, 303, 307, 308].includes(res.status) && res.headers.location) {
+            cur = new URL(res.headers.location, cur).href;
+            continue;
+        }
+        return { status: res.status, text: String(res.data), finalUrl: cur };
+    }
+    throw new Error('too many redirects');
+}
+
+// ── فك الـ packed JS (Dean Edwards) في سياق vm فارغ ──
+function footballMixDropUnpack(packed) {
+    const fnCall = packed.replace(/^eval\(/, '').replace(/\)\s*$/, '');
+    return vm.runInNewContext('(' + fnCall + ')', {});
+}
+
+// ── حجم ملف من صفحة MixDrop (اسم الملف بخط عريض وجنبه "1.28 GB") ──
+function footballMixDropParseSize(text) {
+    const html = String(text);
+    const m = html.match(/\.mp4<\/b>\s*([\d.]+)\s*(GB|MB|KB)/i)
+        || html.match(/<b title="[^"]+">[^<]*<\/b>\s*([\d.]+)\s*(GB|MB|KB)/i);
+    if (!m) return null;
+    const n = parseFloat(m[1]);
+    if (!n) return null;
+    const mult = { GB: 1073741824, MB: 1048576, KB: 1024 }[m[2].toUpperCase()] || 0;
+    return Math.round(n * mult);
+}
+
+// ── مدة mp4 عبر ffprobe (نفس الجهاز اللي جاب التوكن — نفس الـ IP) ──
+function footballProbeMp4Duration(url, headers = {}) {
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (val) => { if (!settled) { settled = true; resolve(val); } };
+        const hdrStr = Object.entries(headers || {})
+            .filter(([k, v]) => v !== undefined && v !== null && String(v).length)
+            .map(([k, v]) => `${k}: ${v}`).join('\r\n');
+        const args = ['-v', 'quiet', '-print_format', 'json', '-show_format',
+            '-analyzeduration', '8000000', '-probesize', '8000000'];
+        if (hdrStr) args.push('-headers', hdrStr + '\r\n');
+        args.push(url);
+        let proc;
+        try { proc = spawn('ffprobe', args); } catch (_) { return finish(null); }
+        let out = '';
+        proc.stdout.on('data', (d) => { out += d.toString(); });
+        proc.on('close', () => {
+            try {
+                const data = JSON.parse(out);
+                const dur = parseFloat(data && data.format && data.format.duration);
+                if (dur && dur > 0) return finish(dur);
+            } catch (_) {}
+            finish(null);
+        });
+        proc.on('error', () => finish(null));
+        setTimeout(() => { try { proc.kill(); } catch (_) {} finish(null); }, 25000);
+    });
+}
+
+// ── MixDrop: حلّ مباراة كاملة من fullmatchshows ──
+// يرجّع { mp4Url, sizeBytes, durationSec, cookie, eUrl, fUrl } أو null
+async function footballResolveMixDrop(match) {
+    const jar = {};
+    // 1) بحث ووردبريس في fullmatchshows عن صفحة المباراة
+    const q = `${match.home} vs ${match.away}`;
+    const sRes = await footballMixDropGet(`${FULLMATCHSHOWS_BASE}/?s=${encodeURIComponent(q)}`, jar);
+    const sHtml = sRes.text;
+    const linkRe = /<a[^>]+href="(https?:\/\/fullmatchshows\.com\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    const candidates = [];
+    let m;
+    while ((m = linkRe.exec(sHtml)) !== null) {
+        const text = m[2].replace(/<[^>]+>/g, ' ');
+        const href = m[1];
+        if (!/\/[^/]+\/$/.test(new URL(href).pathname)) continue;
+        if (!footballHasTeam(text, match.home) || !footballHasTeam(text, match.away)) continue;
+        if (!/full-match/i.test(href + ' ' + text)) continue;
+        candidates.push(href);
+        if (candidates.length >= 3) break;
+    }
+    if (!candidates.length) return null;
+    // فضّل صفحة بتاريخ اليوم أو امبارح (صيغة الرابط: ...-8-nov-2026/)
+    const months = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+    const todayStart = new Date(footballTodayUTC() + 'T00:00:00Z').getTime();
+    let matchUrl = candidates[0];
+    for (const href of candidates) {
+        const dM = href.match(/(\d{1,2})-(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)-(\d{4})/i);
+        if (!dM) continue;
+        const t = Date.UTC(parseInt(dM[3], 10), months[dM[2].toLowerCase()], parseInt(dM[1], 10));
+        if (t >= todayStart - 86400000 && t <= todayStart) { matchUrl = href; break; }
+    }
+    // 2) صفحة المباراة ← رابط mixdrop.top/f/<id>
+    const pRes = await footballMixDropGet(matchUrl, jar, { Referer: FULLMATCHSHOWS_BASE + '/' });
+    const mdM = pRes.text.match(/https?:\/\/(?:www\.)?mixdrop\.[a-z]+\/f\/[A-Za-z0-9]+/i);
+    if (!mdM) return null;
+    // 3) صفحة الملف /f/ (بعد التحويلات) ← الحجم + iframe صفحة التشغيل /e/
+    const fRes = await footballMixDropGet(mdM[0], jar, { Referer: matchUrl });
+    const fHtml = fRes.text;
+    const fUrl = fRes.finalUrl;
+    const sizeBytes = footballMixDropParseSize(fHtml);
+    const ePath = (fHtml.match(/<iframe[^>]+src="(\/e\/[A-Za-z0-9]+)"/) || [])[1]
+        || (fHtml.match(/href="(\/e\/[A-Za-z0-9]+)"/) || [])[1];
+    const eUrl = ePath ? new URL(ePath, fUrl).href : fUrl.replace(/\/f\//, '/e/');
+    // 4) صفحة التشغيل /e/ ← فك packed JS ← MDCore.wurl
+    const eRes = await footballMixDropGet(eUrl, jar, { Referer: fUrl });
+    const pkM = eRes.text.match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\([\s\S]*?\)\)/);
+    if (!pkM) return null;
+    let unpacked;
+    try { unpacked = footballMixDropUnpack(pkM[0]); } catch (_) { return null; }
+    const wM = String(unpacked).match(/MDCore\.wurl\s*=\s*["']([^"']+)["']/);
+    if (!wM) return null;
+    let mp4Url = wM[1];
+    if (mp4Url.startsWith('//')) mp4Url = 'https:' + mp4Url;
+    if (!/^https?:\/\//i.test(mp4Url)) return null;
+    // 5) الحجم (صفحة الملف أولاً، وHEAD بديل) + المدة عبر ffprobe
+    let finalSize = sizeBytes;
+    const cookie = footballMixDropJarHeader(jar, mp4Url);
+    if (!finalSize) {
+        try {
+            const head = await axios.head(mp4Url, {
+                headers: { 'User-Agent': MIXDROP_UA, Referer: eUrl, ...(cookie ? { Cookie: cookie } : {}) },
+                timeout: 15000, maxRedirects: 5, validateStatus: s => s >= 200 && s < 500
+            });
+            const len = parseInt(head.headers['content-length'] || '0', 10);
+            if (len > 0) finalSize = len;
+        } catch (_) {}
+    }
+    const durationSec = await footballProbeMp4Duration(mp4Url, { 'User-Agent': MIXDROP_UA, Referer: eUrl, ...(cookie ? { Cookie: cookie } : {}) });
+    if (durationSec && durationSec < FOOTBALL_FULL_MIN_SEC) return null;
+    if (!durationSec && (!finalSize || finalSize < 500 * 1048576)) return null; // بلا مدة: لازم حجم يوحي بمباراة كاملة
+    return { mp4Url, sizeBytes: finalSize, durationSec: durationSec || null, cookie, eUrl, fUrl };
+}
+// ===== ⚽ .football — END (v117) =====
 
 function isHlsUrl(url) {
     return /\.m3u8(\?|$)/i.test(String(url || ''));
@@ -4617,7 +4794,7 @@ async function startXeonBotInc() {
                             await downloadVideoSmart(finalUrl, outPath, {
                                 'User-Agent': WEB_UA,
                                 'Referer': (cached.referers && cached.referers[idx]) || cached.referer || 'https://akwam.ss/',
-                                ...(cached.headers || {})
+                                ...((cached.headerSets && cached.headerSets[idx]) || cached.headers || {})
                             });
                             if (cached.subtitleUrl) outPath = await muxSubtitleIntoMp4(outPath, cached.subtitleUrl);
 
@@ -5125,13 +5302,15 @@ async function startXeonBotInc() {
                             text: `⏳ جاري البحث عن المباراة الكاملة لـ\n*${matchTitle}*...`
                         }, { quoted: mek });
                         try {
-                            const [sf, ok] = await Promise.allSettled([
+                            const [sf, ok, md] = await Promise.allSettled([
                                 footballResolveSoccerFull(match),
-                                footballResolveOkruFull(match.home, match.away)
+                                footballResolveOkruFull(match.home, match.away),
+                                footballResolveMixDrop(match)
                             ]);
                             const soccerFull = sf.status === 'fulfilled' ? sf.value : null;
                             const okFull = ok.status === 'fulfilled' ? ok.value.full : null;
                             const okHl = ok.status === 'fulfilled' ? ok.value.highlights : null;
+                            const mixDrop = md.status === 'fulfilled' ? md.value : null;
 
                             const options = [];
                             if (soccerFull) {
@@ -5139,6 +5318,14 @@ async function startXeonBotInc() {
                                     label: `⚽ SoccerFull — ${soccerFull.label} (${footballFmtDuration(soccerFull.durationSec)})`,
                                     url: soccerFull.m3u8Url, sizeBytes: soccerFull.sizeBytes,
                                     referer: soccerFull.matchUrl
+                                });
+                            }
+                            if (mixDrop) {
+                                options.push({
+                                    label: `💾 MixDrop — MP4${mixDrop.durationSec ? ` (${footballFmtDuration(mixDrop.durationSec)})` : ''}`,
+                                    url: mixDrop.mp4Url, sizeBytes: mixDrop.sizeBytes,
+                                    referer: mixDrop.eUrl,
+                                    headers: { ...(mixDrop.cookie ? { Cookie: mixDrop.cookie } : {}), Referer: mixDrop.eUrl }
                                 });
                             }
                             if (okFull) {
@@ -5201,6 +5388,7 @@ async function startXeonBotInc() {
                                 names: options.map(o => o.label),
                                 sizes: options.map(o => o.sizeBytes),
                                 referers: options.map(o => o.referer),
+                                headerSets: options.map(o => o.headers || null), // هيدرز مخصصة لكل خيار (MixDrop: كوكيز + Referer) — v117
                                 title: `${matchTitle} — Full Match`,
                                 referer: options[0].referer || 'https://footballzzz.com/',
                                 headers: {},
@@ -7929,7 +8117,8 @@ async function startXeonBotInc() {
                                     lastLeague = mt.league;
                                     responseText += `🏆 *${mt.league}*\n`;
                                 }
-                                responseText += `*${i + 1}* - ${mt.home} 🆚 ${mt.away} ${mt.ready ? '✅' : '⏳'}\n`;
+                                const listSrc = FOOTBALL_LIST_SOURCE_LABEL[mt.source] || mt.source || '';
+                                responseText += `*${i + 1}* - ${mt.home} 🆚 ${mt.away} ${mt.ready ? '✅' : '⏳'}${listSrc ? ` [${listSrc}]` : ''}\n`;
                             });
                             responseText += `\n✅ = الإعادة جاهزة • ⏳ = لسه منزلتش\n💡 رد (Reply) على هذه الرسالة برقم المباراة لعرض الجودات والحجم قبل التحميل.\n⏰ الرد لازم يكون خلال *5 دقايق*.`;
                             if (matches.length > 30) responseText += `\n\n📌 عرض أول 30 مباراة من ${matches.length}.`;
