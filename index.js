@@ -1524,14 +1524,45 @@ async function lfFetchDaddyLive() {
         try { html = await lfGet(cand, 25000); base = cand; break; } catch (_) {}
     }
     if (!html) throw new Error('تعذر الوصول إلى DaddyLive');
+    // نمط مرايا dlhd الحالي: المباريات داخل كتل schedule__event (عنوان + وقت + روابط قنوات watch.php)،
+    // وروابط stream-N.php في الصفحة هي قنوات 24/7 فقط — لا تدخل قائمة المباريات أبداً
+    const sched = lfParseDaddySchedule(html, base);
+    if (sched.length) return sched;
+    // النمط القديم (dlive.sx): روابط stream-N.php قد تحمل مباريات — نقبل فقط ما يدل عنوانه
+    // على مباراة (ضد/وقت)، وإن لم يوجد دليل نعيد قائمة فارغة بدل تسريب القنوات
     const all = lfParseAnchors(html, base)
         .filter(a => /stream-\d+\.php/i.test(a.url))
         .map(a => ({ title: a.title, source: 'DaddyLive', pageUrl: a.url, status: null, startsAt: null }));
-    // الصفحة الرئيسية تخلط جدول المباريات مع شبكة قنوات 24/7 بنفس نمط الروابط:
-    // نفضّل الروابط التي يدل عنوانها على مباراة (فريق ضد فريق أو وقت انطلاق)،
-    // ونرجع لكل الروابط فقط إن لم يوجد أي دليل مباريات (حتى لا تفرغ القائمة).
-    const eventsOnly = all.filter(x => /\bvs\b|\bv\b/i.test(x.title) || /\d{1,2}:\d{2}/.test(x.title));
-    return (eventsOnly.length ? eventsOnly : all).slice(0, 40);
+    return all.filter(x => /\bvs\b|\bv\b/i.test(x.title) || /\d{1,2}:\d{2}/.test(x.title)).slice(0, 40);
+}
+
+// قراءة كتل جدول dlhd: كل كتلة فيها data-title (فيه ⚽ لكرة القدم والوقت)،
+// وعنوان الحدث، وأول رابط قناة watch.php?id=N هو صفحة تشغيل المباراة
+function lfParseDaddySchedule(html, base) {
+    const out = [];
+    const seen = new Set();
+    const parts = String(html).split('<div class="schedule__event">').slice(1);
+    for (const part of parts) {
+        const chunk = part.slice(0, 3000);
+        const dtM = chunk.match(/data-title="([^"]+)"/i);
+        const dataTitle = dtM ? lfDecodeEntities(dtM[1]) : '';
+        const tM = chunk.match(/schedule__eventTitle">([^<]+)</i);
+        const title = tM ? lfDecodeEntities(tM[1]).replace(/\s+/g, ' ').trim() : '';
+        if (!title || !/\bvs\b/i.test(title)) continue; // مباريات فقط (فريق ضد فريق)
+        if (!/⚽|soccer|football/i.test(dataTitle + ' ' + title)) continue; // كرة قدم فقط
+        const linkM = chunk.match(/href="([^"]*watch\.php\?id=\d+)"/i);
+        if (!linkM) continue;
+        let pageUrl;
+        try { pageUrl = new URL(lfDecodeEntities(linkM[1]), base).toString(); } catch (_) { continue; }
+        const timeM = chunk.match(/schedule__time"[^>]*>([^<]+)</i);
+        const startsAt = timeM ? `${timeM[1].trim()} UK` : null;
+        const k = footballNorm(title);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        out.push({ title, source: 'DaddyLive', pageUrl, status: null, startsAt });
+        if (out.length >= 40) break;
+    }
+    return out;
 }
 
 // ── PPV.ST: روابط أحداث حية على نمط /live/{sport}/{date}/{slug} ──
@@ -1639,6 +1670,14 @@ async function lfResolveStream(pageUrl) {
         try { body = await lfGet(url, 25000); } catch (_) { continue; }
         if (typeof body !== 'string') continue;
         const text = body.replace(/\\\//g, '/');
+        // مشغّل مختوم (نمط dembed): الصفحة تحمل ثوابت SRC/CHANNEL/EDGE/TICKET
+        // وقائمتها مشفّرة ومقاطعها مخبأة داخل صور — تُفكّ وقت التسجيل عبر بروكسي محلي
+        const sealed = lfDembedInfo(text, url);
+        if (sealed) {
+            let origin = '';
+            try { origin = new URL(url).origin; } catch (_) {}
+            return { streamUrl: sealed.src, headers: { 'User-Agent': LF_UA, Referer: url, ...(origin ? { Origin: origin } : {}) }, sealedInfo: sealed };
+        }
         const direct = lfExtractM3u8(text, url);
         if (direct) {
             // الـ Referer هو صفحة المشغّل التي وُجد فيها الرابط (أو الصفحة التي ضمّنت ملف JS)
@@ -1755,6 +1794,21 @@ async function lfStartRecording(XeonBotInc, chatId, mek, job) {
         return;
     }
 
+    // بث مختوم: شغّل البروكسي المحلي الذي يفك القائمة والمقاطع لـ ffmpeg
+    if (job.sealedInfo && !job.proxy) {
+        try {
+            job.proxy = await lfStartSealedProxy(job.sealedInfo);
+            job.streamUrl = job.proxy.url;
+            job.headers = {};
+            console.log('[LIVEFOOTBALL] sealed proxy started: ' + job.proxy.url);
+        } catch (e) {
+            await XeonBotInc.sendMessage(chatId, {
+                text: `❌ تعذر تجهيز فك ختم البث: ${e.message}`
+            }, { quoted: mek });
+            return;
+        }
+    }
+
     const duration = job.duration;
     const manualSegmentMinutes = job.manualSegmentMinutes;
     const totalDurationSec = duration * 60;
@@ -1789,11 +1843,14 @@ async function lfStartRecording(XeonBotInc, chatId, mek, job) {
     const qualityNote = job.qualityLabel ? `\n🎞️ الجودة: *${job.qualityLabel}*` : '';
 
     // اطبع رابط البث نفسه ليتمكن المستخدم من تشغيله مباشرة بالتوازي مع التسجيل
-    try {
-        await XeonBotInc.sendMessage(chatId, {
-            text: `🔗 *رابط البث الجاري تسجيله (للتشغيل المباشر):*\n${job.streamUrl}`
-        }, { quoted: mek });
-    } catch (_) {}
+    // (البث المختوم لا يُطبع رابطه الخام — لا يعمل خارج البوت)
+    if (!job.sealedInfo) {
+        try {
+            await XeonBotInc.sendMessage(chatId, {
+                text: `🔗 *رابط البث الجاري تسجيله (للتشغيل المباشر):*\n${job.streamUrl}`
+            }, { quoted: mek });
+        } catch (_) {}
+    }
     await XeonBotInc.sendMessage(chatId, {
         text: `🎙️ *بدأ تسجيل ${kindWord} المباشرة!*\n⚽ ${job.title}\n📡 المصدر: ${job.source}${qualityNote}\n⏱️ المدة الكلية: *${duration} دقيقة*\n📦 كل جزء: *~${segmentMinutes} دقيقة* (تقدير لـ ~${RECORD_TARGET_MB} MB)${bitrateNote}\n🔗 اتصال واحد متواصل بالبث — بدون أي انقطاع بين الأجزاء\n\n🛑 لإلغاء التسجيل في أي وقت: \`${stopCmd}\``
     }, { quoted: mek });
@@ -1837,7 +1894,8 @@ async function lfStartRecording(XeonBotInc, chatId, mek, job) {
                 const startTs = Date.now();
 
                 // إعادة استخراج الرابط عند كل إعادة اتصال (التوكنات قصيرة العمر)، مع إعادة اختيار نفس الجودة
-                if (attempt > 1 && job.pageUrl && !isHlsUrl(job.pageUrl)) {
+                // (البث المختوم يُستثنى: بروكسيه المحلي يجدّد التوكن والتيكيت بنفسه)
+                if (attempt > 1 && job.pageUrl && !isHlsUrl(job.pageUrl) && !job.sealedInfo) {
                     try {
                         const re = await lfResolveStream(job.pageUrl);
                         job.headers = re.headers;
@@ -1888,6 +1946,7 @@ async function lfStartRecording(XeonBotInc, chatId, mek, job) {
             }, { quoted: mek });
         } finally {
             recMap.delete(chatId);
+            if (job.proxy) { try { job.proxy.close(); } catch (_) {} job.proxy = null; }
             try { fs.rmSync(segDir, { recursive: true, force: true }); } catch (_) {}
         }
 
@@ -1917,6 +1976,12 @@ async function lfStartRecording(XeonBotInc, chatId, mek, job) {
 async function lfWizardNext(XeonBotInc, chatId, mek, job) {
     // وضع الرابط فقط: اطبع رابط البث للتشغيل المباشر ولا تسجّل شيئاً
     if (job.linkOnly) {
+        if (job.sealedInfo) {
+            await XeonBotInc.sendMessage(chatId, {
+                text: `🔒 *${job.title}*\n📡 ${job.source}\n\nهذا البث *مختوم*: رابطه الخام لا يعمل في المشغّلات الخارجية لأنه مشفّر ومقاطعه مخبأة — يعمل فقط عبر التسجيل من البوت نفسه.\n▶️ سجّله بنفس الأمر بدون كلمة \`link\` وستصلك الأجزاء هنا مباشرة.`
+            }, { quoted: mek });
+            return;
+        }
         const q = job.qualityLabel || 'الافتراضية';
         await XeonBotInc.sendMessage(chatId, {
             text: `🔗 *رابط البث المباشر — ${job.title}*\n📡 ${job.source} • الجودة: ${q}\n\n${job.streamUrl}\n\n▶️ انسخ الرابط وشغّله في أي مشغّل (VLC أو مشغّل IPTV أو المتصفح). إن توقّف لاحقاً فتوكن هذه المصادر قصير العمر — أعد طلبه بنفس الأمر.`
@@ -1943,6 +2008,12 @@ async function lfWizardNext(XeonBotInc, chatId, mek, job) {
 }
 
 async function lfBeginRecording(XeonBotInc, chatId, mek, job) {
+    // بث مختوم: لا قائمة جودات — جودة واحدة أصلية تُفكّ عبر البروكسي المحلي وقت التسجيل
+    if (job.sealedInfo) {
+        job.qualityLabel = job.qualityLabel || 'الأصلية';
+        await lfWizardNext(XeonBotInc, chatId, mek, job);
+        return;
+    }
     const variants = await lfFetchVariants(job.streamUrl, job.headers);
 
     if (variants.length > 1) {
@@ -2102,6 +2173,243 @@ async function lfFetchAllChannels() {
     }
     return { channels: mixed, failed };
 }
+// ── بث مختوم (نمط dembed): قائمة مشفّرة AES-CTR ومقاطع مخبأة داخل صور PNG ──
+// الصفحة تحمل: const SRC/CHANNEL/EDGE/TICKET. نقطة التوكن: {EDGE}/api/playlist-token?slug={CHANNEL}&tk={TICKET}
+// تعيد {token, k, ttl}. القائمة تُجلب بـ SRC?t={token} ومقاطعها أسطر base64url مشفّرة
+// بمفتاح k (AES-CTR بعدّاد = رقم التسلسل في القائمة). كل مقطع ملف "صورة" من TikTok CDN:
+// بكسلات PNG (بعد فك فلاترها) تبدأ بـ "TIKTIKPX" + طول BE32 + حمولة gzip فيها الـ TS الحقيقي.
+function lfDembedInfo(html, pageUrl) {
+    if (typeof html !== 'string') return null;
+    const grab = (n) => { const m = html.match(new RegExp('const\\s+' + n + '\\s*=\\s*"([^"]+)"')); return m ? m[1] : null; };
+    const src = grab('SRC'), channel = grab('CHANNEL'), edge = grab('EDGE'), ticket = grab('TICKET');
+    if (!src || !channel || !edge) return null;
+    if (!/\.m3u8/i.test(src)) return null;
+    return { src, channel, edge, ticket: ticket || '', pageUrl };
+}
+
+function lfB64UrlBytes(s) {
+    let b = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+    while (b.length % 4) b += '=';
+    return Buffer.from(b, 'base64');
+}
+
+// فك ختم قائمة التشغيل: كل سطر مقطع يُفكّ بعدّاد AES-CTR مبني من رقم تسلسل الوسائط
+function lfUnsealPlaylist(text, kB64) {
+    const crypto = require('crypto');
+    const key = lfB64UrlBytes(kB64);
+    const algo = key.length === 32 ? 'aes-256-ctr' : key.length === 24 ? 'aes-192-ctr' : 'aes-128-ctr';
+    const out = [];
+    let seq = 0;
+    for (const rawLine of String(text).split('\n')) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        if (line.startsWith('#')) {
+            const m = line.match(/^#EXT-X-MEDIA-SEQUENCE:\s*(\d+)/);
+            if (m) seq = Number(m[1]);
+            out.push(line);
+            continue;
+        }
+        const counter = Buffer.alloc(16);
+        counter.writeBigUInt64BE(BigInt(seq), 8);
+        const decipher = crypto.createDecipheriv(algo, key, counter);
+        const plain = Buffer.concat([decipher.update(lfB64UrlBytes(line)), decipher.final()]);
+        out.push(plain.toString('utf8'));
+        seq++;
+    }
+    return out.join('\n');
+}
+
+function lfPaeth(a, b, c) {
+    const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+    if (pa <= pb && pa <= pc) return a;
+    if (pb <= pc) return b;
+    return c;
+}
+
+// فك بكسلات PNG إلى RGB خام (تجميع IDAT + فك zlib + إزالة فلاتر الصفوف)
+function lfPngRGB(buf) {
+    const zlib = require('zlib');
+    if (!buf || buf.length < 8 || buf[0] !== 0x89 || buf[1] !== 0x50) return null;
+    let off = 8, width = 0, height = 0, bitDepth = 0, colorType = 0, interlace = 0;
+    const idats = [];
+    while (off + 8 <= buf.length) {
+        const len = buf.readUInt32BE(off);
+        if (len < 0 || off + 12 + len > buf.length + 4) break;
+        const type = buf.slice(off + 4, off + 8).toString('latin1');
+        const data = buf.slice(off + 8, off + 8 + len);
+        if (type === 'IHDR' && data.length >= 13) {
+            width = data.readUInt32BE(0); height = data.readUInt32BE(4);
+            bitDepth = data[8]; colorType = data[9]; interlace = data[12];
+        } else if (type === 'IDAT') idats.push(data);
+        else if (type === 'IEND') break;
+        off += 12 + len;
+    }
+    if (!width || !height || bitDepth !== 8 || interlace !== 0 || (colorType !== 2 && colorType !== 6)) return null;
+    let raw;
+    try { raw = zlib.inflateSync(Buffer.concat(idats)); } catch (_) { return null; }
+    const bpp = colorType === 6 ? 4 : 3;
+    const rowBytes = width * bpp;
+    if (raw.length < height * (rowBytes + 1)) return null;
+    const out = Buffer.alloc(width * height * 3);
+    let pos = 0, outPos = 0;
+    let prevRow = Buffer.alloc(rowBytes);
+    for (let y = 0; y < height; y++) {
+        const filter = raw[pos++];
+        const row = Buffer.from(raw.slice(pos, pos + rowBytes));
+        pos += rowBytes;
+        for (let i = 0; i < rowBytes; i++) {
+            const left = i >= bpp ? row[i - bpp] : 0, up = prevRow[i], upLeft = i >= bpp ? prevRow[i - bpp] : 0;
+            if (filter === 1) row[i] = (row[i] + left) & 0xff;
+            else if (filter === 2) row[i] = (row[i] + up) & 0xff;
+            else if (filter === 3) row[i] = (row[i] + ((left + up) >> 1)) & 0xff;
+            else if (filter === 4) row[i] = (row[i] + lfPaeth(left, up, upLeft)) & 0xff;
+            else if (filter !== 0) return null;
+        }
+        if (colorType === 2) { row.copy(out, outPos); outPos += rowBytes; }
+        else { for (let i = 0; i < rowBytes; i += 4) { out[outPos++] = row[i]; out[outPos++] = row[i + 1]; out[outPos++] = row[i + 2]; } }
+        prevRow = row;
+    }
+    return out;
+}
+
+// استخراج الـ TS الحقيقي من مقطع "صورة": TIKTIKPX في البكسلات، أو TIKTIKRAW/TSGZ، أو TS بعد IEND
+function lfUnwrapSegment(buf) {
+    const zlib = require('zlib');
+    if (!buf || !buf.length) return null;
+    if (buf[0] === 0x89 && buf[1] === 0x50) {
+        try {
+            const rgb = lfPngRGB(buf);
+            if (rgb && rgb.length >= 12 && rgb.slice(0, 8).toString('latin1') === 'TIKTIKPX') {
+                const L = rgb.readUInt32BE(8);
+                const payload = rgb.slice(12, 12 + L);
+                if (payload.length >= 2 && payload[0] === 0x1f && payload[1] === 0x8b) {
+                    const ts = zlib.gunzipSync(payload);
+                    if (ts.length && ts[0] === 0x47) return ts;
+                }
+            }
+        } catch (_) {}
+        const iend = buf.indexOf('IEND');
+        if (iend >= 0) {
+            const after = iend + 8;
+            if (buf[after] === 0x47 && buf[after + 188] === 0x47) return buf.slice(after);
+        }
+    }
+    let i = buf.indexOf('TIKTIKRAW');
+    if (i >= 0) { const ts = buf.slice(i + 9); if (ts.length && ts[0] === 0x47) return ts; }
+    i = buf.indexOf('TIKTIKTSGZ');
+    if (i >= 0) { try { const ts = zlib.gunzipSync(buf.slice(i + 10)); if (ts.length && ts[0] === 0x47) return ts; } catch (_) {} }
+    for (let s = 0; s + 188 < buf.length; s++) if (buf[s] === 0x47 && buf[s + 188] === 0x47) return buf.slice(s);
+    return null;
+}
+
+// جلسة بث مختوم: تدير التوكن (يُجدّد قبل انتهائه) وجلب القائمة وفكّها
+function lfSealedSession(info) {
+    const state = { info: { ...info }, token: null, k: null, tokenExp: 0 };
+    const pageHeaders = () => {
+        let origin = '';
+        try { origin = new URL(state.info.pageUrl).origin; } catch (_) {}
+        return { 'User-Agent': LF_UA, Referer: state.info.pageUrl, ...(origin ? { Origin: origin } : {}) };
+    };
+    async function refreshPage() {
+        const html = await lfGet(state.info.pageUrl, 25000);
+        const fresh = lfDembedInfo(html, state.info.pageUrl);
+        if (fresh) state.info = fresh;
+        state.token = null; state.k = null; state.tokenExp = 0;
+    }
+    async function ensureToken() {
+        if (state.token && Date.now() < state.tokenExp - 15000) return;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const url = `${state.info.edge}/api/playlist-token?slug=${encodeURIComponent(state.info.channel)}&tk=${encodeURIComponent(state.info.ticket || '')}`;
+            const res = await axios.get(url, { timeout: 15000, validateStatus: () => true, headers: pageHeaders() });
+            if (res.status === 200 && res.data && res.data.token && res.data.k) {
+                state.token = res.data.token;
+                state.k = res.data.k;
+                const ttl = Number(res.data.ttl) || 120;
+                state.tokenExp = Date.now() + ttl * 500; // تجديد في منتصف العمر مثل المشغّل
+                return;
+            }
+            if (attempt === 0) await refreshPage();
+        }
+        throw new Error('تعذر الحصول على توكن البث المختوم');
+    }
+    async function getPlaylistText(proxyBase) {
+        let lastErr = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+                await ensureToken();
+                const res = await axios.get(`${state.info.src}?t=${state.token}`, { timeout: 15000, validateStatus: () => true, responseType: 'text', headers: pageHeaders() });
+                const text = String(res.data || '');
+                if (res.status === 200 && text.startsWith('#EXTM3U')) {
+                    const segLines = text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+                    const sealed = segLines.length > 0 && segLines.some(l => !/^https?:\/\//i.test(l));
+                    const opened = sealed ? lfUnsealPlaylist(text, state.k) : text;
+                    // إعادة كتابة أسطر المقاطع لتمر عبر البروكسي المحلي (فك الخبء هناك)
+                    const rewritten = opened.split('\n').map(l => {
+                        const t = l.trim();
+                        if (!t || t.startsWith('#')) return l;
+                        let abs;
+                        try { abs = new URL(t, state.info.src).toString(); } catch (_) { return l; }
+                        // لاحقة .ts ضرورية: رافض HLS في ffmpeg يرفض المقاطع بلا امتداد معروف
+                        return `${proxyBase}/seg.ts?u=${Buffer.from(abs, 'utf8').toString('base64url')}`;
+                    }).join('\n');
+                    state.lastGood = rewritten;
+                    return rewritten;
+                }
+                lastErr = new Error('playlist HTTP ' + res.status);
+                // رفض التوكن/التيكيت: أعد جلب الصفحة لتيكيت جديد قبل المحاولة التالية
+                if (res.status === 401 || res.status === 403 || res.status === 404) { try { await refreshPage(); } catch (_) {} }
+            } catch (e) { lastErr = e; }
+            await new Promise(r => setTimeout(r, 1200 * (attempt + 1)));
+        }
+        // عند فشل التجديد مؤقتاً: قدّم آخر قائمة ناجحة بدل قطع البث (مقاطعها ما زالت قابلة للجلب)
+        if (state.lastGood) return state.lastGood;
+        throw lastErr || new Error('تعذر جلب قائمة البث المختوم');
+    }
+    async function getSegment(segUrl) {
+        let lastErr = null;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                const res = await axios.get(segUrl, { timeout: 25000, validateStatus: () => true, responseType: 'arraybuffer', headers: pageHeaders() });
+                if (res.status !== 200) throw new Error('segment HTTP ' + res.status);
+                const ts = lfUnwrapSegment(Buffer.from(res.data));
+                if (!ts) throw new Error('تعذر فك خبء المقطع');
+                return ts;
+            } catch (e) { lastErr = e; await new Promise(r => setTimeout(r, 800)); }
+        }
+        throw lastErr || new Error('تعذر جلب المقطع');
+    }
+    return { getPlaylistText, getSegment };
+}
+
+// بروكسي محلي: يقدّم لـ ffmpeg قائمة حية مفكوكة الختم ومقاطع TS حقيقية
+async function lfStartSealedProxy(info) {
+    const http = require('http');
+    const session = lfSealedSession(info);
+    let base = '';
+    const server = http.createServer(async (req, res) => {
+        try {
+            const u = new URL(req.url, base || 'http://127.0.0.1');
+            if (u.pathname === '/pl.m3u8') {
+                const text = await session.getPlaylistText(base);
+                res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-cache' });
+                res.end(text);
+            } else if (u.pathname === '/seg.ts') {
+                const segUrl = Buffer.from(u.searchParams.get('u') || '', 'base64url').toString('utf8');
+                const ts = await session.getSegment(segUrl);
+                res.writeHead(200, { 'Content-Type': 'video/MP2T', 'Cache-Control': 'no-cache' });
+                res.end(ts);
+            } else {
+                res.writeHead(404); res.end('not found');
+            }
+        } catch (e) {
+            try { res.writeHead(502); res.end('sealed proxy error: ' + e.message); } catch (_) {}
+        }
+    });
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+    base = `http://127.0.0.1:${server.address().port}`;
+    return { url: `${base}/pl.m3u8`, close: () => { try { server.close(); } catch (_) {} } };
+}
+
 // ===== ⚽ .livefootball — END (helpers) =====
 
 function isHlsUrl(url) {
@@ -7975,6 +8283,7 @@ async function startXeonBotInc() {
                             const resolved = await lfResolveStream(lfPageUrl);
                             streamUrl = resolved.streamUrl;
                             streamHeaders = resolved.headers;
+                            var lfSealedInfo = resolved.sealedInfo || null;
                         } catch (e) {
                             await XeonBotInc.sendMessage(chatId, {
                                 text: `❌ فشل استخراج البث:\n\`${e.message}\``
@@ -7984,7 +8293,7 @@ async function startXeonBotInc() {
 
                         await lfBeginRecording(XeonBotInc, chatId, mek, {
                             title: lfTitle, source: lfSource, pageUrl: lfPageUrl,
-                            streamUrl, headers: streamHeaders,
+                            streamUrl, headers: streamHeaders, sealedInfo: lfSealedInfo,
                             duration, manualSegmentMinutes, requestedQuality,
                             segDecided: manualSegmentMinutes !== null,
                             linkOnly: lfLinkOnly
@@ -8102,6 +8411,7 @@ async function startXeonBotInc() {
                             const resolved = await lfResolveStream(lcPageUrl);
                             streamUrl = resolved.streamUrl;
                             streamHeaders = resolved.headers;
+                            var lcSealedInfo = resolved.sealedInfo || null;
                         } catch (e) {
                             await XeonBotInc.sendMessage(chatId, {
                                 text: `❌ فشل استخراج البث:\n\`${e.message}\``
@@ -8111,7 +8421,7 @@ async function startXeonBotInc() {
 
                         await lfBeginRecording(XeonBotInc, chatId, mek, {
                             title: lcTitle, source: lcSource, pageUrl: lcPageUrl,
-                            streamUrl, headers: streamHeaders,
+                            streamUrl, headers: streamHeaders, sealedInfo: lcSealedInfo,
                             duration, manualSegmentMinutes, requestedQuality,
                             segDecided: manualSegmentMinutes !== null,
                             linkOnly: lcLinkOnly, isChannel: true
