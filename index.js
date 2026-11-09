@@ -1404,8 +1404,12 @@ async function downloadHlsSegments(url, outPath, headers = {}) {
     }
 }
 
-async function downloadVideoSmart(url, outPath, headers = {}) {
+async function downloadVideoSmart(url, outPath, headers = {}, onProgress = null) {
+    // onProgress اختياري: { downloaded, total, percent, elapsedMs } — يُستخدم لمسار .football فقط (لوج Actions)
+    const notify = (p) => { try { if (typeof onProgress === 'function') onProgress(p); } catch (_) {} };
+    const dlStartedAt = Date.now();
     if (isHlsUrl(url)) {
+        notify({ downloaded: 0, total: null, percent: null, elapsedMs: 0 });
         // ffmpeg بياخد آخر -headers بس — اجمع كل الهيدرات في وسيط واحد مفصول بـ CRLF
         const hdrs = Object.entries(headers || {})
             .filter(([k, v]) => !/^:/.test(k) && v !== undefined && v !== null)
@@ -1414,7 +1418,10 @@ async function downloadVideoSmart(url, outPath, headers = {}) {
         if (hdrs) args.push('-headers', hdrs);
         args.push('-i', url, '-c', 'copy', '-y', outPath);
         const res = await runFfmpeg(args, null);
-        if (res.code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) return;
+        if (res.code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+            notify({ downloaded: fs.statSync(outPath).size, total: null, percent: 100, elapsedMs: Date.now() - dlStartedAt });
+            return;
+        }
         try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
         // بعض سيرفرات HLS (مثل Carateen) مقاطعها بامتداد .jpg فيرفضها ffmpeg —
         // حمّل المقاطع مباشرة وادمجها بدلاً من ذلك
@@ -1422,6 +1429,7 @@ async function downloadVideoSmart(url, outPath, headers = {}) {
         if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
             throw new Error('فشل تحويل بث m3u8 عبر ffmpeg');
         }
+        notify({ downloaded: fs.statSync(outPath).size, total: null, percent: 100, elapsedMs: Date.now() - dlStartedAt });
         return;
     }
     let response;
@@ -1444,6 +1452,12 @@ async function downloadVideoSmart(url, outPath, headers = {}) {
         });
     }
     if (response.status >= 400) throw new Error(`HTTP ${response.status}`);
+    const totalBytes = parseInt(response.headers['content-length'] || '0', 10) || null;
+    let downloadedBytes = 0;
+    response.data.on('data', (chunk) => {
+        downloadedBytes += chunk.length;
+        notify({ downloaded: downloadedBytes, total: totalBytes, percent: totalBytes ? Math.min(100, Math.floor(downloadedBytes / totalBytes * 100)) : null, elapsedMs: Date.now() - dlStartedAt });
+    });
     const writer = fs.createWriteStream(outPath);
     response.data.pipe(writer);
     await new Promise((resolve, reject) => {
@@ -1451,6 +1465,7 @@ async function downloadVideoSmart(url, outPath, headers = {}) {
         writer.on('error', reject);
         response.data.on('error', reject);
     });
+    notify({ downloaded: downloadedBytes, total: totalBytes || downloadedBytes, percent: 100, elapsedMs: Date.now() - dlStartedAt });
     // ملف فارغ = السيرفر لم يرسل بيانات — لا ترسله كأنه تحميل ناجح
     if (!fs.existsSync(outPath) || fs.statSync(outPath).size === 0) {
         try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
@@ -4875,6 +4890,27 @@ async function startXeonBotInc() {
 
                         let outPath;
 
+                        // ── تقدّم تحميل .football في لوج GitHub Actions فقط (v117.4) — رسالة واتساب بدون أي تعديل ──
+                        const footballProgress = !!cached.football;
+                        const footballDlStartAt = Date.now();
+                        const footballKnownTotal = (cached.sizes && cached.sizes[idx]) || null;
+                        let footballLastLogPct = -1;
+                        let footballLastLogAt = Date.now();
+                        const footballFmtMB = (n) => n >= 1073741824 ? (n / 1073741824).toFixed(2) + ' GB' : (n / 1048576).toFixed(1) + ' MB';
+                        const footballOnProgress = footballProgress ? (p) => {
+                            const now = Date.now();
+                            const total = p.total || footballKnownTotal || null;
+                            const pct = total ? Math.min(100, Math.floor((p.downloaded || 0) / total * 100)) : null;
+                            const isFinal = pct === 100;
+                            if (!isFinal && pct !== null && pct - footballLastLogPct < 10 && now - footballLastLogAt < 15000) return;
+                            if (!isFinal && pct === null && now - footballLastLogAt < 15000) return;
+                            footballLastLogPct = pct === null ? footballLastLogPct : pct;
+                            footballLastLogAt = now;
+                            const speed = (p.elapsedMs > 0 && p.downloaded) ? footballFmtMB(Math.round(p.downloaded / (p.elapsedMs / 1000))) + '/s' : '—';
+                            if (pct === null) console.log(`[FOOTBALL-DOWNLOAD] ⏳ ${footballFmtMB(p.downloaded || 0)} / ${total ? footballFmtMB(total) : '؟'} — ${speed}`);
+                            else console.log(`[FOOTBALL-DOWNLOAD] ${pct}% — ${footballFmtMB(p.downloaded || 0)} / ${footballFmtMB(total)} — ${speed}`);
+                        } : null;
+
                         try {
 
                             outPath = path.join(
@@ -4886,11 +4922,13 @@ async function startXeonBotInc() {
                                 'User-Agent': WEB_UA,
                                 'Referer': (cached.referers && cached.referers[idx]) || cached.referer || 'https://akwam.ss/',
                                 ...((cached.headerSets && cached.headerSets[idx]) || cached.headers || {})
-                            });
+                            }, footballOnProgress);
                             if (cached.subtitleUrl) outPath = await muxSubtitleIntoMp4(outPath, cached.subtitleUrl);
 
                             const finalSizeMB =
                             (fs.statSync(outPath).size / 1024 / 1024).toFixed(2);
+
+                            if (footballProgress) console.log(`[FOOTBALL-DOWNLOAD] ✅ اكتمل التحميل — ${cached.title || ''} — ${qName} — ${finalSizeMB} MB — ${((Date.now() - footballDlStartAt) / 1000).toFixed(0)}s`);
 
                         await XeonBotInc.sendMessage(chatId, {
                             document: { url: outPath },
@@ -4904,6 +4942,8 @@ async function startXeonBotInc() {
                         }, { quoted: mek });
 
                         } catch (err) {
+
+                            if (footballProgress) console.log(`[FOOTBALL-DOWNLOAD] ❌ فشل التحميل — ${cached.title || ''} — ${qName}: ${err.message}`);
 
                             try {
                                 if (outPath && fs.existsSync(outPath))
@@ -5454,6 +5494,7 @@ async function startXeonBotInc() {
                                                 title: `${matchTitle} — ملخص`,
                                                 referer: 'https://ok.ru/',
                                                 headers: {},
+                                                football: true, // تقدّم .football في لوج Actions (v117.4)
                                                 timestamp: Date.now()
                                             });
                                             setTimeout(() => qualityCache.delete(sentQ.key.id), 300000);
@@ -5483,6 +5524,7 @@ async function startXeonBotInc() {
                                 title: `${matchTitle} — Full Match`,
                                 referer: options[0].referer || 'https://footballzzz.com/',
                                 headers: {},
+                                football: true, // تقدّم .football في لوج Actions (v117.4)
                                 timestamp: Date.now()
                             });
                             setTimeout(() => qualityCache.delete(sentQ.key.id), 300000);
