@@ -808,7 +808,7 @@ const FOOTBALLZZZ_BASE = 'https://footballzzz.com';
 const FOOTREPLAYS_BASE = 'https://www.footreplays.com';
 const SOCCERFULL_BASE = 'https://soccerfull.net';
 const FULLMATCHSHOWS_BASE = 'https://fullmatchshows.com';
-const FOOTBALL_LIST_SOURCE_LABEL = { footballzzz: 'Footballzzz', footreplays: 'footreplays' }; // وسم مصدر القايمة (v117)
+const FOOTBALL_LIST_SOURCE_LABEL = { footballzzz: 'Footballzzz', footreplays: 'footreplays', fullmatchshows: 'fullmatchshows' }; // وسم مصدر القايمة (v117 + v117.2)
 const FOOTBALL_FULL_MIN_SEC = 3600; // أقل مدة تُعتبر مباراة كاملة (60 دقيقة)
 const FOOTBALL_MAX_DIRECT_BYTES = 2000 * 1048576; // حد واتساب 2GB — فوقه يروح .remotedl
 
@@ -835,7 +835,7 @@ function footballFmtDuration(sec) {
 }
 
 // ── Footballzzz: قايمة مباريات اليوم من الصفحة الرئيسية (server-rendered) ──
-async function footballFetchMatchesFootballzzz() {
+async function footballFetchMatchesFootballzzz(onlyToday = true) {
     const res = await axios.get(FOOTBALLZZZ_BASE + '/', { headers: { 'User-Agent': FOOTBALL_UA }, timeout: 25000 });
     const html = res.data;
     const today = footballTodayUTC();
@@ -846,7 +846,7 @@ async function footballFetchMatchesFootballzzz() {
         const card = m[1];
         const linkM = card.match(/href="(\/replay\/[^"]+)"/);
         const dateM = card.match(/datetime="(\d{4}-\d{2}-\d{2})/);
-        if (!linkM || !dateM || dateM[1] !== today) continue;
+        if (!linkM || !dateM || (onlyToday && dateM[1] !== today)) continue;
         const leagueM = card.match(/comp-badge[^>]*>([^<]+)</);
         const h3M = card.match(/<h3[^>]*>([\s\S]*?)<\/h3>/);
         if (!h3M) continue;
@@ -860,7 +860,8 @@ async function footballFetchMatchesFootballzzz() {
             league: leagueM ? leagueM[1].trim() : 'دوري',
             ready: /full match/i.test(state),
             url: FOOTBALLZZZ_BASE + linkM[1],
-            source: 'footballzzz'
+            source: 'footballzzz',
+            date: dateM[1]
         });
     }
     return matches;
@@ -903,6 +904,64 @@ async function footballFetchTodayMatches() {
     const list2 = await footballFetchMatchesFootreplays();
     if (list2.length) return { matches: list2, source: 'footreplays' };
     return { matches: [], source: 'footballzzz' };
+}
+
+// ── بحث بالفريق (v117.2): fullmatchshows بحث ووردبريس ──
+const FOOTBALL_SEARCH_DAYS = 14; // نطاق البحث بالفريق (يوم)
+const FOOTBALL_SEARCH_MAX = 20; // أقصى مباريات في قايمة البحث
+function footballSlugToName(slug) {
+    return String(slug || '').replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+}
+function footballMonthNum(mon) {
+    return { jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06', jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12' }[String(mon || '').toLowerCase()] || null;
+}
+async function footballSearchFullmatchshows(team) {
+    const res = await axios.get(`${FULLMATCHSHOWS_BASE}/?s=${encodeURIComponent(team)}`, { headers: { 'User-Agent': FOOTBALL_UA }, timeout: 25000 });
+    const html = res.data;
+    const out = [];
+    const seen = new Set();
+    const linkRe = /<a[^>]+href="(https?:\/\/fullmatchshows\.com\/([a-z0-9-]+)-vs-([a-z0-9-]+)-full-match-replay-(\d{1,2})-([a-z]{3})-(\d{4})\/)"[^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    while ((m = linkRe.exec(html)) !== null) {
+        const href = m[1];
+        if (seen.has(href)) continue;
+        seen.add(href);
+        const mon = footballMonthNum(m[5]);
+        if (!mon) continue;
+        const date = `${m[6]}-${mon}-${String(m[4]).padStart(2, '0')}`;
+        const home = footballSlugToName(m[2]);
+        const away = footballSlugToName(m[3]);
+        const title = m[7].replace(/<[^>]+>/g, ' ');
+        if (!footballHasTeam(title, team) && !footballHasTeam(home + ' ' + away, team)) continue;
+        out.push({ home, away, league: 'دوري', ready: true, url: href, source: 'fullmatchshows', date });
+    }
+    return out;
+}
+
+// ── بحث بالفريق: Footballzzz (أيام أخيرة) + fullmatchshows (14 يوم) — الأحدث أولاً ──
+async function footballSearchTeam(team) {
+    const since = Date.now() - FOOTBALL_SEARCH_DAYS * 86400000;
+    const found = [];
+    const seen = new Set();
+    const push = (mt) => {
+        if (!mt || !mt.date) return;
+        const t = Date.parse(mt.date + 'T00:00:00Z');
+        if (isNaN(t) || t < since) return;
+        const key = footballNorm(mt.home) + '|' + footballNorm(mt.away) + '|' + mt.date;
+        if (seen.has(key)) return;
+        seen.add(key);
+        found.push(mt);
+    };
+    try {
+        const zzz = await footballFetchMatchesFootballzzz(false);
+        for (const mt of zzz) if (footballHasTeam(mt.home + ' vs ' + mt.away, team)) push(mt);
+    } catch (_) {}
+    try {
+        const fms = await footballSearchFullmatchshows(team);
+        for (const mt of fms) push(mt);
+    } catch (_) {}
+    found.sort((a, b) => b.date.localeCompare(a.date));
+    return found.slice(0, FOOTBALL_SEARCH_MAX);
 }
 
 // ── تحليل مدة قائمة m3u8 (مجموع #EXTINF) ──
@@ -1219,11 +1278,13 @@ async function footballResolveMixDrop(match) {
     const months = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
     const todayStart = new Date(footballTodayUTC() + 'T00:00:00Z').getTime();
     let matchUrl = candidates[0];
+    const wantDate = match.date ? Date.parse(match.date + 'T00:00:00Z') : NaN; // مباراة البحث: نفس التاريخ المختار
     for (const href of candidates) {
         const dM = href.match(/(\d{1,2})-(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)-(\d{4})/i);
         if (!dM) continue;
         const t = Date.UTC(parseInt(dM[3], 10), months[dM[2].toLowerCase()], parseInt(dM[1], 10));
-        if (t >= todayStart - 86400000 && t <= todayStart) { matchUrl = href; break; }
+        if (!isNaN(wantDate) && t === wantDate) { matchUrl = href; break; }
+        if (isNaN(wantDate) && t >= todayStart - 86400000 && t <= todayStart) { matchUrl = href; break; }
     }
     // 2) صفحة المباراة ← رابط mixdrop.top/f/<id>
     const pRes = await footballMixDropGet(matchUrl, jar, { Referer: FULLMATCHSHOWS_BASE + '/' });
@@ -6209,6 +6270,7 @@ async function startXeonBotInc() {
 ⚽ *كورة — إعادة مباريات*
 • \`.football recent\` — مباريات اليوم من كل الدوريات (من غير حرق)
   ↳ مثال: \`.football recent\` — رد برقم المباراة لعرض الجودات والحجم قبل التحميل
+• \`.football <فريق>\` — ابحث عن مباريات فريق من آخر 14 يوم (مثال: \`.football liverpool\`)
   ↳ لو الحجم فوق 2GB البوت هيطبع لك الرابط والحجم، وتمرّره بنفسك لـ \`.remotedl\` مع حجم الجزء اللي تختاره
 
 📖 *مانجا وفيديو*
@@ -8095,13 +8157,40 @@ async function startXeonBotInc() {
                         return;
                     }
 
-                    // ── أمر .football — إعادة مباريات اليوم ──
+                    // ── أمر .football — إعادة مباريات اليوم + بحث بالفريق (v117.2) ──
                     if (command === '.football') {
                         const sub = (query || '').split(/\s+/)[0].toLowerCase();
-                        if (!query || sub !== 'recent') {
+                        if (!query) {
                             await XeonBotInc.sendMessage(chatId, {
-                                text: '⚽ *أمر .football — إعادة مباريات كرة القدم*\n\n• `.football recent` — مباريات اليوم من كل الدوريات (من غير حرق: لا نتائج ولا أهداف)\n  ↳ رد برقم المباراة لعرض الجودات والحجم قبل التحميل\n\n💡 *مثال:* `.football recent`'
+                                text: '⚽ *أمر .football — إعادة مباريات كرة القدم*\n\n• `.football recent` — مباريات اليوم من كل الدوريات (من غير حرق: لا نتائج ولا أهداف)\n  ↳ رد برقم المباراة لعرض الجودات والحجم قبل التحميل\n• `.football <فريق>` — ابحث عن مباريات فريق (بالإنجليزية) من آخر 14 يوم، الأحدث أولاً\n  ↳ مثال: `.football liverpool`\n\n💡 *مثال:* `.football recent`'
                             }, { quoted: mek });
+                            return;
+                        }
+                        if (sub !== 'recent') {
+                            // ── بحث بالفريق ──
+                            const team = query.trim();
+                            try {
+                                await XeonBotInc.sendMessage(chatId, { text: `🔍 جاري البحث عن مباريات *${team}*...` }, { quoted: mek });
+                                const matches = await footballSearchTeam(team);
+                                if (!matches.length) throw new Error(`لا توجد مباريات لـ "${team}" في آخر 14 يوم في المصادر المتاحة حالياً. جرّب اسم الفريق بالإنجليزية.`);
+                                const shown = matches.slice(0, 20);
+                                let responseText = `⚽ *مباريات ${team} — آخر 14 يوم*\n\n`;
+                                let lastDate = null;
+                                shown.forEach((mt, i) => {
+                                    if (mt.date !== lastDate) {
+                                        lastDate = mt.date;
+                                        responseText += `📅 *${new Date(mt.date + 'T00:00:00Z').toLocaleDateString('ar-EG', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Africa/Cairo' })}*\n`;
+                                    }
+                                    const listSrc = FOOTBALL_LIST_SOURCE_LABEL[mt.source] || mt.source || '';
+                                    responseText += `*${i + 1}* - ${mt.home} 🆚 ${mt.away} ${mt.ready ? '✅' : '⏳'}${listSrc ? ` [${listSrc}]` : ''}\n`;
+                                });
+                                responseText += `\n✅ = الإعادة جاهزة • ⏳ = لسه منزلتش\n💡 رد (Reply) على هذه الرسالة برقم المباراة لعرض الجودات والحجم قبل التحميل.\n⏰ الرد لازم يكون خلال *5 دقايق*.`;
+                                const sentMsg = await XeonBotInc.sendMessage(chatId, { text: responseText }, { quoted: mek });
+                                footballCache.set(sentMsg.key.id, { matches: shown, timestamp: Date.now() });
+                                setTimeout(() => footballCache.delete(sentMsg.key.id), 300000);
+                            } catch (err) {
+                                await XeonBotInc.sendMessage(chatId, { text: `❌ فشل البحث عن مباريات ${team}:\n\`${err.message}\`` }, { quoted: mek });
+                            }
                             return;
                         }
                         try {
