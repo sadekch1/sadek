@@ -1469,36 +1469,44 @@ function lfIframeSrcs(html, baseUrl) {
 // ── DamiTV: API عام موثّق — GET ondemand.st/papi/api/streams ──
 // يعيد فئات → بثوث فيها teams وstarts_at وstatus ومصفوفة sources وحقل iframe (صفحة embed).
 async function lfFetchDamitv() {
+    // البنية الحقيقية للـ API (تم التحقق منها): { streams: [ {category, streams: [event]} ] }
+    // الفئات: football/cricket/basketball/... + فئة "24/7-streams" للقنوات.
+    // الحدث: {name, starts_at (epoch), status, league, teams:{home:{name},away:{name}},
+    //          always_live (1=قناة 24/7), sources:[{name:"Server 1", embed}], embed}
+    // نأخذ فئة football فقط، ونستبعد القنوات (always_live=1) وأي عنصر بلا فريقين —
+    // ولا ندخل أبداً داخل sources[] (أسماؤها "Server 1"... ليست مباريات).
     const data = await lfGet('https://ondemand.st/papi/api/streams', 25000);
-    const root = (data && (data.data || data.streams || data.categories)) || data;
+    const groups = (data && Array.isArray(data.streams)) ? data.streams : [];
     const out = [];
-    const walk = (node, category) => {
-        if (!node || typeof node !== 'object') return;
-        if (Array.isArray(node)) { node.forEach(n => walk(n, category)); return; }
-        const cat = node.name && (node.streams || node.events) ? node.name : category;
-        const title = node.title || node.name;
-        const teams = node.teams;
-        const teamTitle = teams
-            ? (Array.isArray(teams) ? teams.map(t => t.name || t).filter(Boolean).join(' vs ')
-                : [teams.home, teams.away].filter(Boolean).join(' vs ') || [teams.home_team, teams.away_team].filter(Boolean).join(' vs '))
-            : '';
-        const embed = node.iframe || node.embed || node.embed_url || null;
-        if (embed && (teamTitle || title)) {
-            const catText = footballNorm([cat, node.category, node.sport, node.league].filter(Boolean).join(' '));
-            const isFootball = !catText || /football|soccer/.test(catText);
-            if (isFootball) {
-                out.push({
-                    title: teamTitle || String(title),
-                    source: 'DamiTV',
-                    pageUrl: String(embed),
-                    status: node.status || null,
-                    startsAt: node.starts_at || node.start_time || null
-                });
+    for (const group of groups) {
+        const cat = String((group && (group.category || group.category_name)) || '').toLowerCase();
+        if (cat !== 'football' && cat !== 'soccer') continue;
+        const events = Array.isArray(group.streams) ? group.streams : [];
+        for (const ev of events) {
+            if (!ev || typeof ev !== 'object') continue;
+            if (ev.always_live === 1 || ev.always_live === true) continue; // قناة 24/7
+            const home = ev.teams && ev.teams.home && ev.teams.home.name ? String(ev.teams.home.name).trim() : '';
+            const away = ev.teams && ev.teams.away && ev.teams.away.name ? String(ev.teams.away.name).trim() : '';
+            const title = (home && away) ? `${home} vs ${away}` : String(ev.name || '').trim();
+            if (!title || !/\bvs\b|\bv\b/i.test(title)) continue; // بلا "فريق ضد فريق" = ليست مباراة
+            const embed = ev.embed || (Array.isArray(ev.sources) && ev.sources[0] && ev.sources[0].embed) || null;
+            if (!embed) continue;
+            let startsAt = null;
+            const ts = typeof ev.starts_at === 'number' ? ev.starts_at : parseInt(ev.starts_at);
+            if (ts && ts > 0) {
+                const d = new Date(ts * 1000);
+                startsAt = d.toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
             }
+            out.push({
+                title,
+                source: 'DamiTV',
+                pageUrl: String(embed),
+                status: ev.status || null,
+                startsAt,
+                league: ev.league || null
+            });
         }
-        for (const v of Object.values(node)) if (v && typeof v === 'object') walk(v, cat);
-    };
-    walk(root, '');
+    }
     const seen = new Set();
     return out.filter(x => !seen.has(x.pageUrl) && seen.add(x.pageUrl)).slice(0, 40);
 }
@@ -1511,10 +1519,14 @@ async function lfFetchDaddyLive() {
         try { html = await lfGet(cand, 25000); base = cand; break; } catch (_) {}
     }
     if (!html) throw new Error('تعذر الوصول إلى DaddyLive');
-    return lfParseAnchors(html, base)
+    const all = lfParseAnchors(html, base)
         .filter(a => /stream-\d+\.php/i.test(a.url))
-        .map(a => ({ title: a.title, source: 'DaddyLive', pageUrl: a.url, status: null, startsAt: null }))
-        .slice(0, 40);
+        .map(a => ({ title: a.title, source: 'DaddyLive', pageUrl: a.url, status: null, startsAt: null }));
+    // الصفحة الرئيسية تخلط جدول المباريات مع شبكة قنوات 24/7 بنفس نمط الروابط:
+    // نفضّل الروابط التي يدل عنوانها على مباراة (فريق ضد فريق أو وقت انطلاق)،
+    // ونرجع لكل الروابط فقط إن لم يوجد أي دليل مباريات (حتى لا تفرغ القائمة).
+    const eventsOnly = all.filter(x => /\bvs\b|\bv\b/i.test(x.title) || /\d{1,2}:\d{2}/.test(x.title));
+    return (eventsOnly.length ? eventsOnly : all).slice(0, 40);
 }
 
 // ── PPV.ST: روابط أحداث حية على نمط /live/{sport}/{date}/{slug} ──
@@ -1558,11 +1570,27 @@ async function lfFetchAllEvents() {
     });
     const seen = new Set();
     const deduped = all.filter(x => {
+        if (!x.title || /^server\s*\d+$/i.test(x.title.trim())) return false; // أسماء سيرفرات ليست مباريات
         const k = footballNorm(x.title) + '|' + x.source;
-        if (seen.has(k) || !x.title) return false;
+        if (seen.has(k)) return false;
         seen.add(k); return true;
     });
-    return { matches: deduped.slice(0, 30), failed };
+    // خلط المصادر بالتناوب حتى لا يحتكر أول مصدر القائمة كلها ويحجب الباقي
+    const bySource = new Map();
+    for (const mt of deduped) {
+        if (!bySource.has(mt.source)) bySource.set(mt.source, []);
+        bySource.get(mt.source).push(mt);
+    }
+    const queues = [...bySource.values()];
+    const mixed = [];
+    let progressed = true;
+    while (mixed.length < 30 && progressed) {
+        progressed = false;
+        for (const q of queues) {
+            if (q.length) { mixed.push(q.shift()); progressed = true; if (mixed.length >= 30) break; }
+        }
+    }
+    return { matches: mixed, failed };
 }
 
 // ── استخراج رابط البث الفعلي (m3u8) من صفحة مباراة/مشغّل ──
@@ -7499,7 +7527,7 @@ async function startXeonBotInc() {
                                 liveFootballLists.set(chatId, { matches: filtered, at: Date.now() });
                                 let msg = `⚽ *مباريات كرة القدم (${filtered.length}):*\n\n`;
                                 filtered.forEach((mt, i) => {
-                                    const meta = [mt.source, mt.status, mt.startsAt].filter(Boolean).join(' • ');
+                                    const meta = [mt.source, mt.league, mt.status, mt.startsAt].filter(Boolean).join(' • ');
                                     msg += `*${i + 1}.* ${mt.title}\n📡 ${meta}\n\n`;
                                 });
                                 if (failed.length) msg += `⚠️ تعذر جلب: ${failed.join('، ')}\n\n`;
