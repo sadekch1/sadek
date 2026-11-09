@@ -2099,7 +2099,16 @@ async function lfFetchDaddyChannels() {
         try { u = new URL(lfDecodeEntities(m[1]), base).toString(); } catch (_) { continue; }
         if (!map.has(u)) map.set(u, { title: name, source: 'DaddyLive', pageUrl: u, status: 'live', startsAt: null });
     }
-    return [...map.values()].slice(0, 80);
+    // إزالة تكرار الاسم نفسه (القناة الواحدة قد تظهر في الجدول والدليل معاً)،
+    // وترتيب أبجدي حتى يجد المستخدم أي قناة بالبحث — بلا قصّ مبكر يخفي قنوات الدليل
+    const byTitle = new Map();
+    for (const ch of map.values()) {
+        const k = footballNorm(ch.title);
+        if (!byTitle.has(k)) byTitle.set(k, ch);
+    }
+    return [...byTitle.values()]
+        .sort((a, b) => a.title.localeCompare(b.title))
+        .slice(0, 300);
 }
 
 // اكتشاف عام للقنوات عند أي موقع آخر: روابط تبدو كقنوات، وعنوانها اسم قناة
@@ -2165,7 +2174,7 @@ async function lfFetchAllChannels() {
     const queues = [...bySource.values()];
     const mixed = [];
     let added = true;
-    while (added && mixed.length < 60) {
+    while (added && mixed.length < 200) {
         added = false;
         for (const q of queues) {
             if (q.length) { mixed.push(q.shift()); added = true; if (mixed.length >= 60) break; }
