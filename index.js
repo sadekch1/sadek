@@ -1503,6 +1503,7 @@ async function lfFetchDamitv() {
                 pageUrl: String(embed),
                 status: ev.status || null,
                 startsAt,
+                startsAtTs: (ts && ts > 0) ? ts : null,
                 league: ev.league || null
             });
         }
@@ -1539,12 +1540,23 @@ async function lfFetchPpv() {
 }
 
 // ── جالب عام لصفحات أحداث/كرة قدم عند مجمّعات أخرى ──
-async function lfFetchGeneric(sourceName, pageUrl, hrefFilter) {
+// تنظيفات مبنية على مخرجات حقيقية: روابط التنقل بين الأقسام ("Football"، "Soccer"،
+// "Formula 1"، "YouTube")، روابط لمواقع خارجية، ونصوص قوالب JS غير مُنفّذة
+// (مثل "${escapeHtml(stream.name)}" عند StreamFree) — كلها ليست مباريات.
+// القاعدة: روابط من نفس نطاق الصفحة فقط + تفضيل (أو اشتراط عند strict)
+// عناوين تدل على مباراة: "فريق vs فريق" أو وقت/تاريخ انطلاق.
+async function lfFetchGeneric(sourceName, pageUrl, hrefFilter, opts = {}) {
     const html = await lfGet(pageUrl, 25000);
-    return lfParseAnchors(html, pageUrl)
+    const pageHost = new URL(pageUrl).hostname;
+    let items = lfParseAnchors(html, pageUrl)
+        .filter(a => { try { return new URL(a.url).hostname === pageHost; } catch (_) { return false; } })
         .filter(a => hrefFilter(a))
-        .map(a => ({ title: a.title, source: sourceName, pageUrl: a.url, status: null, startsAt: null }))
-        .slice(0, 40);
+        .filter(a => !a.title.includes('${') && !/escapeHtml/i.test(a.title))
+        .map(a => ({ title: a.title, source: sourceName, pageUrl: a.url, status: null, startsAt: null }));
+    const evidence = items.filter(x => /\bvs\b|\bv\b/i.test(x.title) || /\d{1,2}:\d{2}/.test(x.title) || /\d{1,2}\/\d{1,2}/.test(x.title));
+    if (evidence.length) items = evidence;
+    else if (opts.strict) items = [];
+    return items.slice(0, 40);
 }
 
 const LF_FETCHERS = [
@@ -1552,11 +1564,12 @@ const LF_FETCHERS = [
     lfFetchDaddyLive,
     lfFetchPpv,
     () => lfFetchGeneric('SportsBite', 'https://sportsbite.org/sport/football', a => /football|soccer|match|watch|stream/i.test(a.url)),
-    () => lfFetchGeneric('FCTV33', 'https://www.fctv33go.autos/football.html', a => !/\.html?$/i.test(new URL(a.url).pathname) || /football|match|live/i.test(a.url)),
+    // صفحات الأقسام نفسها (.html) روابط تنقل وليست مباريات — نأخذ روابط الأحداث فقط، وبصرامة
+    () => lfFetchGeneric('FCTV33', 'https://www.fctv33go.autos/football.html', a => !/\.html?$/i.test(new URL(a.url).pathname), { strict: true }),
     () => lfFetchGeneric('WatchSports', 'https://watchsports.su/', a => /\/football\//i.test(a.url)),
-    () => lfFetchGeneric('RoxieStreams', 'https://roxiestreams.su/', a => /football|soccer/i.test(a.title + ' ' + a.url)),
-    () => lfFetchGeneric('StreamFree', 'https://strmfree.pk/', a => /football|soccer|match|live|watch/i.test(a.title + ' ' + a.url)),
-    () => lfFetchGeneric('TheTVApp', 'https://thetvapp.plus/', a => /soccer|football/i.test(a.title + ' ' + a.url)),
+    () => lfFetchGeneric('RoxieStreams', 'https://roxiestreams.su/', a => /football|soccer/i.test(a.title + ' ' + a.url), { strict: true }),
+    () => lfFetchGeneric('StreamFree', 'https://strmfree.pk/', a => /football|soccer|match|live|watch/i.test(a.title + ' ' + a.url), { strict: true }),
+    () => lfFetchGeneric('TheTVApp', 'https://thetvapp.plus/', a => /soccer|football/i.test(a.title + ' ' + a.url), { strict: true }),
 ];
 
 // جلب أحداث كل المصادر التلقائية بالتوازي — فشل مصدر لا يوقف الباقي
@@ -1569,8 +1582,11 @@ async function lfFetchAllEvents() {
         else failed.push(LF_SOURCES[i] ? LF_SOURCES[i].name : `مصدر ${i + 1}`);
     });
     const seen = new Set();
+    const LF_NAV_TITLES = new Set(['football', 'soccer', 'american football', 'am football', 'formula 1', 'f1', 'youtube', 'home', 'live', 'live football', 'live soccer', 'basketball', 'hockey', 'tennis', 'cricket']);
     const deduped = all.filter(x => {
         if (!x.title || /^server\s*\d+$/i.test(x.title.trim())) return false; // أسماء سيرفرات ليست مباريات
+        if (x.title.includes('${') || /escapeHtml/i.test(x.title)) return false; // نص قالب JS غير مُنفّذ
+        if (LF_NAV_TITLES.has(footballNorm(x.title))) return false; // روابط تنقل بين الأقسام
         const k = footballNorm(x.title) + '|' + x.source;
         if (seen.has(k)) return false;
         seen.add(k); return true;
@@ -1599,28 +1615,41 @@ async function lfResolveStream(pageUrl) {
     if (isHlsUrl(pageUrl)) {
         return { streamUrl: pageUrl, headers: { 'User-Agent': LF_UA, Referer: pageUrl } };
     }
-    const queue = [{ url: pageUrl, depth: 0 }];
+    // يتبع iframes وملفات JavaScript (بعض المشغلات تضع رابط m3u8 داخل ملف JS
+    // أو بروابط مهربّة \/ داخل كود الصفحة) — حتى مستويين وبحد أقصى للزيارات.
+    const queue = [{ url: pageUrl, depth: 0, kind: 'page', via: pageUrl }];
     const visited = new Set();
-    while (queue.length) {
-        const { url, depth } = queue.shift();
+    while (queue.length && visited.size < 14) {
+        const { url, depth, kind, via } = queue.shift();
         if (visited.has(url)) continue;
         visited.add(url);
-        let html;
-        try { html = await lfGet(url, 25000); } catch (_) { continue; }
-        if (typeof html !== 'string') continue;
-        const direct = lfExtractM3u8(html, url);
+        let body;
+        try { body = await lfGet(url, 25000); } catch (_) { continue; }
+        if (typeof body !== 'string') continue;
+        const text = body.replace(/\\\//g, '/');
+        const direct = lfExtractM3u8(text, url);
         if (direct) {
+            // الـ Referer هو صفحة المشغّل التي وُجد فيها الرابط (أو الصفحة التي ضمّنت ملف JS)
+            const referer = kind === 'js' ? (via || pageUrl) : url;
             let origin = '';
-            try { origin = new URL(url).origin; } catch (_) {}
-            return { streamUrl: direct, headers: { 'User-Agent': LF_UA, Referer: url, ...(origin ? { Origin: origin } : {}) } };
+            try { origin = new URL(referer).origin; } catch (_) {}
+            return { streamUrl: direct, headers: { 'User-Agent': LF_UA, Referer: referer, ...(origin ? { Origin: origin } : {}) } };
         }
-        if (depth < 2) {
-            for (const f of lfIframeSrcs(html, url)) {
-                if (/player|embed|stream|watch|cast/i.test(f) || isHlsUrl(f)) queue.push({ url: f, depth: depth + 1 });
+        if (kind === 'page' && depth < 2) {
+            for (const f of lfIframeSrcs(text, url)) {
+                if (/player|embed|stream|watch|cast/i.test(f) || isHlsUrl(f)) queue.push({ url: f, depth: depth + 1, kind: 'page', via: url });
+            }
+            const scriptRe = /<script\s[^>]*src\s*=\s*["']([^"']+)["']/gi;
+            let sm;
+            while ((sm = scriptRe.exec(text)) !== null) {
+                try {
+                    const su = new URL(lfDecodeEntities(sm[1]).trim(), url).toString();
+                    if (/\.js($|\?)/i.test(su)) queue.push({ url: su, depth: depth + 1, kind: 'js', via: url });
+                } catch (_) {}
             }
         }
     }
-    throw new Error('لم يتم العثور على رابط بث (m3u8) داخل صفحة المباراة. جرّب رابطاً مباشراً أو مصدراً آخر.');
+    throw new Error('لم يتم العثور على رابط بث (m3u8) داخل صفحة المباراة. إن كانت المباراة لم تبدأ بعد فالبث غير موجود أصلاً — أعد المحاولة عند انطلاقها، أو جرّب مصدراً آخر.');
 }
 
 function lfHeadersString(headers) {
@@ -7552,6 +7581,7 @@ async function startXeonBotInc() {
                         }
                         let lfTitle, lfSource, lfPageUrl;
                         let lfDurationArg, lfSegArg;
+                        let lfStartsAtTs = null, lfStartsAtLabel = null, lfStatus = null;
                         if (isPickArg) {
                             const list = liveFootballLists.get(chatId).matches;
                             const pick = parseInt(args[1]);
@@ -7564,6 +7594,9 @@ async function startXeonBotInc() {
                             const chosen = list[pick - 1];
                             lfTitle = chosen.title; lfSource = chosen.source; lfPageUrl = chosen.pageUrl;
                             lfDurationArg = lfTail[0]; lfSegArg = lfTail[1];
+                            lfStartsAtTs = chosen.startsAtTs || null;
+                            lfStartsAtLabel = chosen.startsAt || null;
+                            lfStatus = chosen.status || null;
                         } else {
                             lfPageUrl = args[1];
                             lfTitle = 'مباراة مباشرة';
@@ -7583,6 +7616,15 @@ async function startXeonBotInc() {
                         if (manualSegmentMinutes !== null && (manualSegmentMinutes < 1 || manualSegmentMinutes > duration)) {
                             await XeonBotInc.sendMessage(chatId, {
                                 text: `❌ مدة الجزء يجب أن تكون بين 1 دقيقة والمدة الكلية.`
+                            }, { quoted: mek });
+                            return;
+                        }
+
+                        // مباراة لم تبدأ بعد: لا يوجد بث أصلاً قبل الانطلاق، فلا نحاول الاستخراج عبثاً
+                        if (lfStartsAtTs && lfStatus !== 'live' && (lfStartsAtTs * 1000 - Date.now() > 10 * 60 * 1000)) {
+                            const minsLeft = Math.ceil((lfStartsAtTs * 1000 - Date.now()) / 60000);
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `⏳ *هذه المباراة لم تبدأ بعد.*\n⚽ ${lfTitle}\n🕐 تبدأ: ${lfStartsAtLabel || ''} (بعد ~${minsLeft} دقيقة)\n\nبث هذه المصادر يظهر عادة قبل الانطلاق بدقائق فقط. أعد المحاولة عند بداية المباراة وسيعمل الاستخراج.`
                             }, { quoted: mek });
                             return;
                         }
