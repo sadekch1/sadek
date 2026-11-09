@@ -809,6 +809,7 @@ const FOOTREPLAYS_BASE = 'https://www.footreplays.com';
 const SOCCERFULL_BASE = 'https://soccerfull.net';
 const FULLMATCHSHOWS_BASE = 'https://fullmatchshows.com';
 const FOOTBALL_LIST_SOURCE_LABEL = { footballzzz: 'Footballzzz', footreplays: 'footreplays', fullmatchshows: 'fullmatchshows' }; // وسم مصدر القايمة (v117 + v117.2)
+const FOOTBALL_LIST_SOURCE_ORDER = ['footballzzz', 'footreplays', 'fullmatchshows']; // ترتيب ثابت لوسم المصادر (v117.3)
 const FOOTBALL_FULL_MIN_SEC = 3600; // أقل مدة تُعتبر مباراة كاملة (60 دقيقة)
 const FOOTBALL_MAX_DIRECT_BYTES = 2000 * 1048576; // حد واتساب 2GB — فوقه يروح .remotedl
 
@@ -832,6 +833,36 @@ function footballHasTeam(text, team) {
 function footballFmtDuration(sec) {
     const m = Math.round(sec / 60);
     return `${m} دقيقة`;
+}
+
+// ── دمج قوائم من مصادر متعددة (v117.3): الماتش يظهر مرة واحدة بسطر واحد،
+// لكن الوسم يجمع كل المصادر اللي اتلاقى فيها (بترتيب ثابت) بدل حذف التكرار ──
+function footballMergeMatches(lists) {
+    const byKey = new Map();
+    for (const list of lists) {
+        for (const mt of (list || [])) {
+            const key = footballNorm(mt.home) + '|' + footballNorm(mt.away) + '|' + (mt.date || '');
+            if (!byKey.has(key)) {
+                byKey.set(key, { ...mt, sources: mt.source ? [mt.source] : [] });
+                continue;
+            }
+            const ex = byKey.get(key);
+            if (mt.source && !ex.sources.includes(mt.source)) ex.sources.push(mt.source);
+            if (mt.ready) ex.ready = true;
+            if (!ex.url && mt.url) ex.url = mt.url;
+        }
+    }
+    const out = [...byKey.values()];
+    for (const mt of out) {
+        mt.sources.sort((a, b) => FOOTBALL_LIST_SOURCE_ORDER.indexOf(a) - FOOTBALL_LIST_SOURCE_ORDER.indexOf(b));
+        mt.source = mt.sources[0] || mt.source; // توافق: أول مصدر
+    }
+    return out;
+}
+
+function footballListLabel(mt) {
+    const srcs = (mt.sources && mt.sources.length ? mt.sources : (mt.source ? [mt.source] : []));
+    return srcs.map(s => FOOTBALL_LIST_SOURCE_LABEL[s] || s).filter(Boolean).join(', ');
 }
 
 // ── Footballzzz: قايمة مباريات اليوم من الصفحة الرئيسية (server-rendered) ──
@@ -895,15 +926,18 @@ async function footballFetchMatchesFootreplays() {
     return matches;
 }
 
-// ── قايمة اليوم: Footballzzz أولاً، وfootreplays بديل إن فشل أو رجّع صفر ──
+// ── قايمة اليوم (v117.3): Footballzzz + footreplays مدموجتين — كل المصادر، مش بديل ──
 async function footballFetchTodayMatches() {
-    try {
-        const list = await footballFetchMatchesFootballzzz();
-        if (list.length) return { matches: list, source: 'footballzzz' };
-    } catch (_) {}
-    const list2 = await footballFetchMatchesFootreplays();
-    if (list2.length) return { matches: list2, source: 'footreplays' };
-    return { matches: [], source: 'footballzzz' };
+    const today = footballTodayUTC();
+    const settled = await Promise.allSettled([
+        footballFetchMatchesFootballzzz(),
+        footballFetchMatchesFootreplays()
+    ]);
+    const lists = [];
+    if (settled[0].status === 'fulfilled') lists.push(settled[0].value);
+    if (settled[1].status === 'fulfilled') lists.push(settled[1].value.map(mt => ({ ...mt, date: mt.date || today }))); // footreplays بلا تاريخ — ماتشاته بتاعة النهاردة بالتعريف
+    const matches = footballMergeMatches(lists);
+    return { matches, source: matches.length ? (matches[0].sources[0] || 'footballzzz') : 'footballzzz' };
 }
 
 // ── بحث بالفريق (v117.2): fullmatchshows بحث ووردبريس ──
@@ -941,25 +975,21 @@ async function footballSearchFullmatchshows(team) {
 // ── بحث بالفريق: Footballzzz (أيام أخيرة) + fullmatchshows (14 يوم) — الأحدث أولاً ──
 async function footballSearchTeam(team) {
     const since = Date.now() - FOOTBALL_SEARCH_DAYS * 86400000;
-    const found = [];
-    const seen = new Set();
-    const push = (mt) => {
-        if (!mt || !mt.date) return;
-        const t = Date.parse(mt.date + 'T00:00:00Z');
-        if (isNaN(t) || t < since) return;
-        const key = footballNorm(mt.home) + '|' + footballNorm(mt.away) + '|' + mt.date;
-        if (seen.has(key)) return;
-        seen.add(key);
-        found.push(mt);
-    };
+    const lists = [];
     try {
         const zzz = await footballFetchMatchesFootballzzz(false);
-        for (const mt of zzz) if (footballHasTeam(mt.home + ' vs ' + mt.away, team)) push(mt);
+        lists.push(zzz.filter(mt => footballHasTeam(mt.home + ' vs ' + mt.away, team)));
     } catch (_) {}
     try {
         const fms = await footballSearchFullmatchshows(team);
-        for (const mt of fms) push(mt);
+        lists.push(fms);
     } catch (_) {}
+    const merged = footballMergeMatches(lists); // v117.3: تجميع المصادر بدل حذف المكرر
+    const found = merged.filter(mt => {
+        if (!mt.date) return false;
+        const t = Date.parse(mt.date + 'T00:00:00Z');
+        return !isNaN(t) && t >= since;
+    });
     found.sort((a, b) => b.date.localeCompare(a.date));
     return found.slice(0, FOOTBALL_SEARCH_MAX);
 }
@@ -8181,7 +8211,7 @@ async function startXeonBotInc() {
                                         lastDate = mt.date;
                                         responseText += `📅 *${new Date(mt.date + 'T00:00:00Z').toLocaleDateString('ar-EG', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Africa/Cairo' })}*\n`;
                                     }
-                                    const listSrc = FOOTBALL_LIST_SOURCE_LABEL[mt.source] || mt.source || '';
+                                    const listSrc = footballListLabel(mt);
                                     responseText += `*${i + 1}* - ${mt.home} 🆚 ${mt.away} ${mt.ready ? '✅' : '⏳'}${listSrc ? ` [${listSrc}]` : ''}\n`;
                                 });
                                 responseText += `\n✅ = الإعادة جاهزة • ⏳ = لسه منزلتش\n💡 رد (Reply) على هذه الرسالة برقم المباراة لعرض الجودات والحجم قبل التحميل.\n⏰ الرد لازم يكون خلال *5 دقايق*.`;
@@ -8206,7 +8236,7 @@ async function startXeonBotInc() {
                                     lastLeague = mt.league;
                                     responseText += `🏆 *${mt.league}*\n`;
                                 }
-                                const listSrc = FOOTBALL_LIST_SOURCE_LABEL[mt.source] || mt.source || '';
+                                const listSrc = footballListLabel(mt);
                                 responseText += `*${i + 1}* - ${mt.home} 🆚 ${mt.away} ${mt.ready ? '✅' : '⏳'}${listSrc ? ` [${listSrc}]` : ''}\n`;
                             });
                             responseText += `\n✅ = الإعادة جاهزة • ⏳ = لسه منزلتش\n💡 رد (Reply) على هذه الرسالة برقم المباراة لعرض الجودات والحجم قبل التحميل.\n⏰ الرد لازم يكون خلال *5 دقايق*.`;
