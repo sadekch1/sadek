@@ -385,6 +385,247 @@ async function replaceM3USource(newUrl) {
     }
 }
 
+// ===== 📱.apkvision — BEGIN =====
+// ============================================================
+// 📱 APKVision — أمر .apkvision
+// بحث في apkvision.org ← قائمة نتائج مرقّمة ← رد برقم ← جلب ملفات
+// صفحة التطبيق/اللعبة ومعالجتها بقاعدة 200MB المتفق عليها:
+// كل ملف حجمه < 200MB يُحمَّل ويُرسَل في المحادثة، وكل ملف أكبر
+// يُرسَل رابطه المباشر فقط. الحجم يُقرأ من زر التحميل في الصفحة،
+// ويُتحقق منه فعلياً أثناء التحميل كخط دفاع ثانٍ.
+// ============================================================
+const AV_BASE = 'https://apkvision.org';
+const AV_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const AV_MAX_SEND_MB = 200; // نفس حد MAX_DOWNLOAD_MB المعتمد في البوت
+const AV_MAX_FILES = 8;     // حد أقصى لعدد الملفات المعالجة من صفحة واحدة
+const apkVisionCache = new Map(); // sentMsgId -> { results: [{title, version, url}] }
+
+function avStripTags(s) {
+    return String(s || '')
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&#8211;|&ndash;/gi, '–')
+        .replace(/&#038;|&amp;/gi, '&')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+// "7.1 GB" -> 7270.4 | "850 MB" -> 850 | "900 KB" -> 0.88 | لا حجم -> null
+function avParseSizeMB(text) {
+    const m = String(text || '').match(/([\d]+(?:[.,]\d+)?)\s*(GB|MB|KB)\b/i);
+    if (!m) return null;
+    const v = parseFloat(m[1].replace(',', '.'));
+    const u = m[2].toUpperCase();
+    if (u === 'GB') return v * 1024;
+    if (u === 'KB') return v / 1024;
+    return v;
+}
+
+async function avFetchHtml(url) {
+    const res = await axios.get(url, {
+        headers: { 'User-Agent': AV_UA },
+        timeout: 30000,
+        maxRedirects: 5
+    });
+    return String(res.data || '');
+}
+
+// استخراج بطاقات التطبيقات/الألعاب {title, version, url} من أي مقطع HTML
+function avParseCards(html, limit = 10) {
+    const results = [];
+    const seen = new Set();
+    const cardRe = /<a[^>]+href="(https:\/\/apkvision\.org\/(?:app|games)\/[^"]+)"[^>]*class="[^"]*apk-browse-card[^"]*"[^>]*>([\s\S]*?)<\/a>|<a[^>]+class="[^"]*apk-browse-card[^"]*"[^>]*href="(https:\/\/apkvision\.org\/(?:app|games)\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    while ((m = cardRe.exec(html)) !== null && results.length < limit) {
+        const url = m[1] || m[3];
+        const inner = m[2] || m[4] || '';
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        const titleM = inner.match(/apk-browse-card__title"[^>]*>([\s\S]*?)<\/span>/i);
+        const verM = inner.match(/apk-browse-card__version"[^>]*>([\s\S]*?)<\/span>/i);
+        results.push({
+            title: avStripTags(titleM ? titleM[1] : url),
+            version: verM ? avStripTags(verM[1]) : '',
+            url
+        });
+    }
+    return results;
+}
+
+// بحث الموقع: يعيد حتى 10 نتائج من بطاقات النتائج
+async function avSearch(query) {
+    const html = await avFetchHtml(`${AV_BASE}/?s=${encodeURIComponent(query)}`);
+    return avParseCards(html, 10);
+}
+
+// وسوم تصفّح مثل الموقع نفسه (أقسام الصفحة الرئيسية):
+// popular ≈ الأكثر تحميلاً/الرائج — best ≈ الأفضل (لا توجد قائمة "تقييم" حرفية في الموقع)
+// best وeditors للألعاب فقط في الموقع (لا لوحة تطبيقات لهما)
+const AV_TAGS = [
+    { key: 'popular', tab: 'popular', label: '🔥 الشائع / الأكثر تحميلاً', gamesOnly: false, aliases: ['popular', 'trending', 'top', 'downloaded', 'most downloaded', 'شائع', 'رائج', 'ترند', 'الأكثر تحميلًا', 'الاكثر تحميلا', 'الأكثر تحميلاً', 'مشهور'] },
+    { key: 'newest', tab: 'newest', label: '🆕 الأحدث', gamesOnly: false, aliases: ['new', 'newest', 'latest', 'جديد', 'الأحدث', 'احدث'] },
+    { key: 'updated', tab: 'updated', label: '🔄 آخر التحديثات', gamesOnly: false, aliases: ['updated', 'update', 'updates', 'محدث', 'التحديثات', 'آخر تحديث', 'اخر تحديث'] },
+    { key: 'best', tab: 'best', label: '🏆 أفضل الإصدارات الجديدة', gamesOnly: true, aliases: ['best', 'rating', 'top rated', 'الأفضل', 'افضل', 'التقييم', 'الأعلى تقييمًا', 'الأعلى تقييما'] },
+    { key: 'editors', tab: 'editors', label: '⭐ اختيار المحررين', gamesOnly: true, aliases: ['editors', 'editor', 'choice', 'editors choice', 'المحررين', 'اختيار المحررين'] }
+];
+
+function avFindTag(query) {
+    const q = String(query || '').trim().toLowerCase();
+    return AV_TAGS.find(t => t.key === q || t.aliases.some(a => a.toLowerCase() === q)) || null;
+}
+
+// قائمة وسم: بطاقات لوحات الصفحة الرئيسية (ألعاب ثم تطبيقات) حتى 10 نتائج
+async function avTagList(tag) {
+    const html = await avFetchHtml(`${AV_BASE}/`);
+    const sections = tag.gamesOnly ? ['games'] : ['games', 'apps'];
+    let merged = [];
+    for (const section of sections) {
+        const marker = `id="home-${section}-${tag.tab}"`;
+        const start = html.indexOf(marker);
+        if (start < 0) continue;
+        const next = html.indexOf('id="home-', start + marker.length);
+        const slice = html.slice(start, next > 0 ? next : start + 45000);
+        merged = merged.concat(avParseCards(slice, 16));
+    }
+    const seen = new Set();
+    return merged.filter(r => (seen.has(r.url) ? false : (seen.add(r.url), true))).slice(0, 10);
+}
+
+// ملفات صفحة التطبيق: أزرار التحميل fdl-btn المؤدية لصفحات /download/
+// [{label, type, sizeMB, sizeText, dlPageUrl}]
+async function avGetFiles(pageUrl) {
+    const html = await avFetchHtml(pageUrl);
+    const files = [];
+    const seen = new Set();
+    const btnRe = /<a[^>]+href="(https:\/\/apkvision\.org\/[^"]+\/download\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    while ((m = btnRe.exec(html)) !== null && files.length < AV_MAX_FILES) {
+        const dlPageUrl = m[1];
+        // فقط ملفات هذه الصفحة نفسها (لا روابط تنزيل لتطبيقات أخرى)
+        if (!dlPageUrl.startsWith(pageUrl)) continue;
+        if (seen.has(dlPageUrl)) continue;
+        seen.add(dlPageUrl);
+        const text = avStripTags(m[2]); // مثال: "Download APKS v1.87.0 7.1 GB · Full - Rockstar version APKS"
+        const sizeM = text.match(/([\d]+(?:[.,]\d+)?)\s*(GB|MB|KB)\b/i);
+        const typeM = m[2].match(/fdl-btn-type"[^>]*>([\s\S]*?)<\/span>/i);
+        files.push({
+            label: text,
+            type: typeM ? avStripTags(typeM[1]) : '',
+            sizeMB: avParseSizeMB(text),
+            sizeText: sizeM ? `${sizeM[1]} ${sizeM[2].toUpperCase()}` : '',
+            dlPageUrl
+        });
+    }
+    return files;
+}
+
+// الرابط المباشر للملف من صفحة التحميل: زر التحميل الرئيسي على dl.apkvision.org
+async function avResolveDirect(dlPageUrl) {
+    const html = await avFetchHtml(dlPageUrl);
+    const main = html.match(/<a[^>]+class="[^"]*downad[^"]*"[^>]*href="(https:\/\/dl\.apkvision\.org\/[^"]+)"/i)
+        || html.match(/<a[^>]+href="(https:\/\/dl\.apkvision\.org\/[^"]+)"[^>]*class="[^"]*downad/i);
+    if (main) return main[1];
+    const all = [...html.matchAll(/href="(https:\/\/dl\.apkvision\.org\/[^"]+)"/gi)].map(x => x[1]);
+    return all.find(u => !u.includes('/apkvision-store/')) || null;
+}
+
+// معالجة ملف واحد بقاعدة 200MB: إرسال ملفاً أو رابطاً مباشراً
+async function avSendFile(XeonBotInc, chatId, mek, appTitle, file) {
+    const direct = await avResolveDirect(file.dlPageUrl);
+    if (!direct) {
+        await XeonBotInc.sendMessage(chatId, {
+            text: `⚠️ *${file.label}*\nتعذّر استخراج الرابط المباشر — إليك صفحة التحميل:\n${file.dlPageUrl}`
+        }, { quoted: mek });
+        return;
+    }
+    const fileName = decodeURIComponent(direct.split('/').pop() || 'file.apk');
+
+    // الحجم: من الصفحة أولاً، وإلا من ترويسة الرابط المباشر
+    let sizeMB = file.sizeMB;
+    if (sizeMB === null) {
+        try {
+            const head = await axios.head(direct, { headers: { 'User-Agent': AV_UA }, timeout: 20000 });
+            const len = parseInt(head.headers['content-length']);
+            if (len > 0) sizeMB = len / 1024 / 1024;
+        } catch (_) {}
+    }
+
+    if (sizeMB !== null && sizeMB >= AV_MAX_SEND_MB) {
+        await XeonBotInc.sendMessage(chatId, {
+            text: `🔗 *${file.label}*\n📱 ${appTitle}\n⚖️ الحجم: ${file.sizeText || sizeMB.toFixed(1) + ' MB'} — أكبر من ${AV_MAX_SEND_MB}MB فلن يُرسَل كملف.\n⬇️ *رابط التحميل المباشر:*\n${direct}`
+        }, { quoted: mek });
+        return;
+    }
+
+    // تحت الحد: تحميل مُراقَب الحجم ثم إرسال كملف
+    const tmpDir = path.join(process.cwd(), 'dltmp');
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+    const ext = (fileName.match(/\.[a-z0-9]+$/i) || ['.apk'])[0].toLowerCase();
+    const outPath = path.join(tmpDir, `av_${Date.now()}_${randomBytes(2).toString('hex')}${ext}`);
+    try {
+        const response = await axios({
+            method: 'GET', url: direct, responseType: 'stream',
+            timeout: 600000, headers: { 'User-Agent': AV_UA }
+        });
+        const limit = AV_MAX_SEND_MB * 1024 * 1024;
+        let downloaded = 0;
+        let tooBig = false;
+        await new Promise((resolve, reject) => {
+            const writer = fs.createWriteStream(outPath);
+            response.data.on('data', (chunk) => {
+                downloaded += chunk.length;
+                if (downloaded > limit && !tooBig) {
+                    tooBig = true;
+                    try { response.data.destroy(); } catch (_) {}
+                    try { writer.destroy(); } catch (_) {}
+                    resolve();
+                }
+            });
+            response.data.on('error', reject);
+            writer.on('error', reject);
+            writer.on('finish', resolve);
+            response.data.pipe(writer);
+        });
+        if (tooBig) {
+            try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
+            await XeonBotInc.sendMessage(chatId, {
+                text: `🔗 *${file.label}*\n📱 ${appTitle}\n⚖️ الحجم الفعلي تجاوز ${AV_MAX_SEND_MB}MB أثناء التحميل — إليك *الرابط المباشر:*\n${direct}`
+            }, { quoted: mek });
+            return;
+        }
+        const realMB = (fs.statSync(outPath).size / 1024 / 1024).toFixed(2);
+        const mime = ext === '.apk' ? 'application/vnd.android.package-archive'
+            : ext === '.zip' ? 'application/zip'
+            : 'application/octet-stream';
+        await XeonBotInc.sendMessage(chatId, {
+            document: { url: outPath },
+            mimetype: mime,
+            fileName,
+            caption: `🤖 *${appTitle}*\n📄 ${file.label}\n⚖️ الحجم: ${realMB} MB\n📡 المصدر: APKVision`
+        }, { quoted: mek });
+    } catch (e) {
+        await XeonBotInc.sendMessage(chatId, {
+            text: `⚠️ *${file.label}*\nفشل تحميل الملف (${e.message}) — إليك *الرابط المباشر:*\n${direct}`
+        }, { quoted: mek });
+    } finally {
+        try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
+    }
+}
+
+// جلب ملفات نتيجة مختارة ومعالجتها واحداً واحداً
+async function avProcessApp(XeonBotInc, chatId, mek, item) {
+    const files = await avGetFiles(item.url);
+    if (files.length === 0) throw new Error('لم يتم العثور على ملفات تحميل في صفحة التطبيق.');
+    let head = `📦 *${item.title}*${item.version ? `\n🏷️ ${item.version}` : ''}\n📄 عدد الملفات: ${files.length}`;
+    files.forEach((f, i) => { head += `\n${i + 1}. ${f.label}`; });
+    head += `\n\n⏳ جاري المعالجة: ما دون ${AV_MAX_SEND_MB}MB يُرسَل ملفاً، والأكبر يصلك رابطه المباشر.`;
+    await XeonBotInc.sendMessage(chatId, { text: head }, { quoted: mek });
+    for (const f of files) {
+        await avSendFile(XeonBotInc, chatId, mek, item.title, f);
+    }
+}
+// ===== 📱.apkvision — END =====
+
 // ============================================================
 // إعدادات "المُنزّل عن بُعد" (Remote Downloader عبر GitHub Actions)
 // يعتمد على مستودع خارجي (fork من sadekch1/file-splitter) يحتوي على
@@ -6525,6 +6766,27 @@ async function startXeonBotInc() {
                         return;
                     }
 
+                    // ── اختيار نتيجة .apkvision بالرد برقم ──
+                    if (apkVisionCache.has(quotedId)) {
+                        const cached = apkVisionCache.get(quotedId);
+                        const num = parseInt(String(replyText).trim());
+                        if (isNaN(num) || num < 1 || num > cached.results.length) {
+                            await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من قائمة النتائج.' }, { quoted: mek });
+                            return;
+                        }
+                        const item = cached.results[num - 1];
+                        apkVisionCache.delete(quotedId);
+                        try {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `⏳ جاري جلب ملفات *${item.title}* من APKVision...`
+                            }, { quoted: mek });
+                            await avProcessApp(XeonBotInc, chatId, mek, item);
+                        } catch (err) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ ${err.message}` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
                     // ── اختيار مباراة من قايمة .football recent ──
                     if (footballCache.has(quotedId)) {
                         const cached = footballCache.get(quotedId);
@@ -7517,6 +7779,8 @@ async function startXeonBotInc() {
 
 📱 *أدوات*
 • \`.apk <اسم>\` — ابحث وحمّل تطبيق APK
+• \`.apkvision <اسم>\` — ابحث في APKVision واختر برقم: أقل من 200MB يُرسل ملفاً والأكبر رابطه المباشر
+• \`.apkvision\` — قائمة وسوم التصفح (popular / new / updated / best / editors) مثل أقسام الموقع
   ↳ مثال: \`.apk mt manager\`
 • \`.sh <أمر>\` — نفّذ أمر شل (للمالك فقط)
 • \`.cwd\` — اعرض مجلد العمل الحالي
@@ -9627,6 +9891,48 @@ async function startXeonBotInc() {
                             try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch (_) {}
                         } catch (err) {
                             await XeonBotInc.sendMessage(chatId, { text: `❌ تعذر تحميل الـ APK:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
+                    // ── أمر .apkvision ──
+                    if (command === '.apkvision') {
+                        if (!query) {
+                            let menu = '📱 *APKVision — كيف تريد أن تتصفح؟*\n\n🔍 *بحث بالاسم:* `.apkvision <اسم التطبيق أو اللعبة>`\nمثال: `.apkvision gta san andreas`\n\n🏷️ *أو تصفّح بوسم مثل الموقع:*';
+                            AV_TAGS.forEach(t => { menu += `\n• \`.apkvision ${t.key}\` — ${t.label}`; });
+                            menu += '\n\nبعد ظهور القائمة، ردّ (Reply) برقم النتيجة لجلب ملفاتها.';
+                            await XeonBotInc.sendMessage(chatId, { text: menu }, { quoted: mek });
+                            return;
+                        }
+                        try {
+                            const tag = avFindTag(query);
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: tag
+                                    ? `🔍 جاري جلب قائمة *${tag.label}* من APKVision...`
+                                    : `🔍 جاري البحث عن *${query}* في APKVision...`
+                            }, { quoted: mek });
+
+                            const results = tag ? await avTagList(tag) : await avSearch(query);
+                            if (results.length === 0) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `❌ لم يتم العثور على نتائج لـ *${query}* في APKVision.`
+                                }, { quoted: mek });
+                                return;
+                            }
+
+                            let msg = tag
+                                ? `📱 *${tag.label} — APKVision:*\n`
+                                : `📱 *نتائج APKVision لـ ${query}:*\n`;
+                            results.forEach((r, i) => {
+                                msg += `\n*${i + 1}.* ${r.title}${r.version ? `\n🏷️ ${r.version}` : ''}`;
+                            });
+                            msg += `\n\n💡 **رد (Reply)** على هذه الرسالة برقم النتيجة لجلب ملفاتها: ما دون ${AV_MAX_SEND_MB}MB يُرسَل ملفاً، والأكبر يصلك رابطه المباشر.`;
+
+                            const sent = await XeonBotInc.sendMessage(chatId, { text: msg }, { quoted: mek });
+                            apkVisionCache.set(sent.key.id, { results, timestamp: Date.now() });
+                            setTimeout(() => apkVisionCache.delete(sent.key.id), 300000);
+                        } catch (err) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ تعذر البحث في APKVision:\n\`${err.message}\`` }, { quoted: mek });
                         }
                         return;
                     }
