@@ -211,6 +211,55 @@ const activeIptvRecordings = new Map(); // chatId -> { proc, cancelled }
 const activeLiveFootballRecordings = new Map(); // chatId -> { proc, cancelled, streamHeaders }
 const activeLiveChannelRecordings = new Map(); // chatId -> { proc, cancelled, streamHeaders } — تسجيلات .livechannel
 
+// ── تتبع تسجيلات .tflix النشطة وخطواتها التفاعلية ──
+const activeTflixRecordings = new Map(); // chatId -> { stopped }
+const tflixWizardCache = new Map(); // sentMsgId -> job (مراحل: channel/quality/duration/segment)
+const tflixLists = new Map(); // chatId -> { events, at }
+
+// ── دومين tflix قابل للتبديل بأمر .settflix (يُحفظ في data/ فيبقى بعد إعادة التشغيل) ──
+const TFLIX_CONFIG_PATH = path.join(process.cwd(), 'data', 'tflix_config.json');
+const TFLIX_CONFIG = { domain: 'tflix.su' };
+try {
+    if (fs.existsSync(TFLIX_CONFIG_PATH)) {
+        const savedTflix = JSON.parse(fs.readFileSync(TFLIX_CONFIG_PATH, 'utf8'));
+        if (savedTflix && savedTflix.domain) TFLIX_CONFIG.domain = String(savedTflix.domain).trim();
+    }
+} catch (_) {}
+function tflixNormalizeDomain(input) {
+    let s = String(input || '').trim().toLowerCase().replace(/^['"]+|['"]+$/g, '');
+    s = s.replace(/^https?:\/\//, '').replace(/\/.*$/, '').replace(/^www\./, '');
+    return /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(s) ? s : null;
+}
+function tflixSaveDomain(newDomain) {
+    TFLIX_CONFIG.domain = newDomain;
+    try {
+        const dataDir = path.dirname(TFLIX_CONFIG_PATH);
+        if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+        fs.writeFileSync(TFLIX_CONFIG_PATH, JSON.stringify({ domain: newDomain }, null, 2));
+    } catch (_) {}
+}
+// معالج .tflix -domain <جديد> / .settflix — عرض الدومين الحالي أو تبديله وحفظه دائماً
+async function tflixDomainCommand(XeonBotInc, chatId, mek, rawValue) {
+    if (!rawValue) {
+        await XeonBotInc.sendMessage(chatId, {
+            text: `🌐 *دومين tflix الحالي:* ${TFLIX_CONFIG.domain}\n\n💡 لتبديله إن تغيّر عنوان الموقع:\n\`.tflix -domain <الدومين الجديد>\`\nمثال: \`.tflix -domain tflix.su\``
+        }, { quoted: mek });
+        return;
+    }
+    const nd = tflixNormalizeDomain(rawValue);
+    if (!nd) {
+        await XeonBotInc.sendMessage(chatId, {
+            text: `❌ هذا ليس دوميناً صالحاً: \`${rawValue}\`\nاكتبه بهذا الشكل: \`example.com\` (بلا https وبلا مسارات).`
+        }, { quoted: mek });
+        return;
+    }
+    const old = TFLIX_CONFIG.domain;
+    tflixSaveDomain(nd);
+    await XeonBotInc.sendMessage(chatId, {
+        text: `✅ *تم تبديل دومين tflix:*\n${old} ← ${nd}\n\nيُطبَّق فوراً على كل أوامر .tflix ويبقى محفوظاً بعد إعادة تشغيل البوت.`
+    }, { quoted: mek });
+}
+
 const UGEEN_CONFIG = {
     host: "https://ugeen.live",
     user: "Ugeen_VIPT8j6wm",
@@ -1366,6 +1415,516 @@ async function footballResolveMixDrop(match) {
     return { mp4Url, sizeBytes: finalSize, durationSec: durationSec || null, cookie, eUrl, fUrl };
 }
 // ===== ⚽ .football — END (v117) =====
+
+// ===== 🎬 .tflix — BEGIN =====
+// بث tflix مشفّر ClearKey (DASH/MPD): الموقع يرفض طلبات HTTP/1.1 بصمت (401)،
+// فالاستخراج يتم عبر HTTP/2 بأدوات Node المدمجة وبلا أي متصفح أو مكتبة خارجية:
+// صفحة المشاهدة ← صفحة المشغّل (التوكن) ← تسجيل المشاهدة (track) ← واجهة التشغيل
+// تعطي رابط MPD + مفتاح ClearKey، ثم تُحمَّل المقاطع وتُفكّ بـ ffmpeg
+// (-decryption_key) نسخاً بلا إعادة ترميز — بنفس منطق أجزاء .record تقريباً.
+// الدومين من TFLIX_CONFIG ويُبدَّل بـ .tflix -domain <الدومين الجديد>.
+const net = require('net');
+const tls = require('tls');
+const http2 = require('http2');
+const https = require('https');
+const zlib = require('zlib');
+
+const TFLIX_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const TFLIX_FETCH_H = { 'accept': '*/*', 'accept-language': 'en-US,en;q=0.9', 'accept-encoding': 'gzip, deflate, br', 'sec-fetch-dest': 'empty', 'sec-fetch-mode': 'cors', 'sec-fetch-site': 'same-origin', 'priority': 'u=1, i' };
+const TFLIX_PAGE_H = { 'accept': 'text/html,application/xhtml+xml', 'accept-language': 'en-US,en;q=0.9', 'accept-encoding': 'gzip, deflate, br' };
+
+function tflixTlsSocket(host) {
+    return new Promise((resolve, reject) => {
+        const proxy = process.env.https_proxy || process.env.HTTPS_PROXY;
+        if (!proxy) {
+            const s = tls.connect({ host, port: 443, servername: host, ALPNProtocols: ['h2'] });
+            s.on('secureConnect', () => resolve(s));
+            s.on('error', reject);
+            return;
+        }
+        const u = new URL(proxy);
+        const auth = 'Basic ' + Buffer.from(decodeURIComponent(u.username || '') + ':' + decodeURIComponent(u.password || '')).toString('base64');
+        const raw = net.connect(parseInt(u.port, 10), u.hostname, () => {
+            raw.write('CONNECT ' + host + ':443 HTTP/1.1\r\nHost: ' + host + ':443\r\nProxy-Authorization: ' + auth + '\r\n\r\n');
+        });
+        let buf = Buffer.alloc(0);
+        raw.on('data', (d) => {
+            buf = Buffer.concat([buf, d]);
+            const idx = buf.indexOf('\r\n\r\n');
+            if (idx >= 0) {
+                const line = buf.slice(0, buf.indexOf('\r\n')).toString();
+                if (!/ 200 /.test(line + ' ')) { raw.destroy(); return reject(new Error('CONNECT failed: ' + line)); }
+                raw.removeAllListeners('data');
+                const secure = tls.connect({ socket: raw, servername: host, ALPNProtocols: ['h2'], rejectUnauthorized: false });
+                secure.on('secureConnect', () => resolve(secure));
+                secure.on('error', reject);
+            }
+        });
+        raw.on('error', reject);
+    });
+}
+
+async function tflixH2Session(host) {
+    const sock = await tflixTlsSocket(host);
+    const client = http2.connect('https://' + host, { createConnection: () => sock });
+    await new Promise((res, rej) => { client.on('connect', res); client.on('error', rej); setTimeout(() => rej(new Error('h2 connect timeout')), 20000); });
+    const call = (method, p, headers, body) => new Promise((resolve, reject) => {
+        const req = client.request({ ':method': method, ':path': p, 'user-agent': TFLIX_UA, ...headers });
+        const chunks = [];
+        let status = 0, enc = null;
+        req.on('response', (h) => { status = h[':status']; enc = h['content-encoding']; });
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+            let b = Buffer.concat(chunks);
+            try {
+                if (enc === 'gzip') b = zlib.gunzipSync(b);
+                else if (enc === 'br') b = zlib.brotliDecompressSync(b);
+                else if (enc === 'deflate') b = zlib.inflateSync(b);
+            } catch (e) {}
+            resolve({ status, body: b.toString('utf8') });
+        });
+        req.on('error', reject);
+        req.setTimeout(30000, () => req.destroy(new Error('h2 req timeout')));
+        if (body) req.end(body); else req.end();
+    });
+    return { call, close: () => { try { client.close(); } catch (e) {} } };
+}
+
+function tflixDecodeBody(buf, enc) {
+    try {
+        if (enc === 'gzip') return zlib.gunzipSync(buf);
+        if (enc === 'br') return zlib.brotliDecompressSync(buf);
+        if (enc === 'deflate') return zlib.inflateSync(buf);
+    } catch (e) {}
+    return buf;
+}
+
+// تحميل عادي (HTTP/1.1) — يُستخدم لشبكة CDN الخاصة بالمقاطع وقائمة MPD فقط،
+// فهي تقبل الطلبات العادية؛ أما واجهات tflix نفسها فتمر عبر جلسة HTTP/2 أعلاه.
+function tflixHttpGetBuffer(url, timeoutMs = 20000) {
+    return new Promise((resolve, reject) => {
+        const req = https.get(url, { headers: { 'User-Agent': TFLIX_UA, 'Accept': '*/*' } }, (res) => {
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                res.resume();
+                return resolve(tflixHttpGetBuffer(new URL(res.headers.location, url).toString(), timeoutMs));
+            }
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => {
+                if (res.statusCode !== 200) return reject(new Error('HTTP ' + res.statusCode + ' for ' + url.slice(0, 90)));
+                resolve(tflixDecodeBody(Buffer.concat(chunks), res.headers['content-encoding']));
+            });
+        });
+        req.on('error', reject);
+        req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout ' + url.slice(0, 90))));
+    });
+}
+
+// قائمة أحداث كرة القدم من خلاصة الموقع العامة (تشمل القنوات المضمّنة لكل حدث)
+async function tflixListEvents(domain) {
+    const s = await tflixH2Session(domain);
+    try {
+        const r = await s.call('GET', '/api/public?scope=football', TFLIX_PAGE_H);
+        if (r.status !== 200) throw new Error('خلاصة tflix أجابت HTTP ' + r.status);
+        const j = JSON.parse(r.body);
+        const now = Date.now();
+        return (j.events || [])
+            .filter(e => e && e.sport === 'Football' && e.watch_url)
+            .map(e => {
+                const start = Date.parse(e.starts_at || '') || 0;
+                const end = Date.parse(e.ends_at || '') || 0;
+                return {
+                    feedId: e.id, title: e.title || ((e.home_name || '') + ' vs ' + (e.away_name || '')),
+                    competition: e.competition || '', startsAt: start, endsAt: end,
+                    live: start <= now && now < end, watchPath: e.watch_url,
+                    channels: (e.channels || []).map(c => ({ id: c.id, name: c.name || c.id, playbackType: c.playbackType || '' })),
+                };
+            })
+            .sort((a, b) => (b.live - a.live) || (a.startsAt - b.startsAt));
+    } finally { s.close(); }
+}
+
+// قراءة بيانات الحدث من JSON المضمّن في صفحة المشاهدة (لروابط .tflix المباشرة)
+function tflixParseWatchBootstrap(html) {
+    const key = '"events":';
+    const ki = html.indexOf(key);
+    if (ki < 0) return null;
+    let i = html.indexOf('[', ki);
+    if (i < 0) return null;
+    let depth = 0, j = i, inStr = false, esc = false;
+    for (; j < html.length; j++) {
+        const ch = html[j];
+        if (inStr) { if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false; continue; }
+        if (ch === '"') inStr = true;
+        else if (ch === '[') depth++;
+        else if (ch === ']') { depth--; if (depth === 0) break; }
+    }
+    try {
+        const arr = JSON.parse(html.slice(i, j + 1));
+        if (!Array.isArray(arr) || !arr.length) return null;
+        const e = arr[0];
+        return {
+            feedId: e.id, title: e.title || '', watchPath: e.watch_url || '',
+            channels: (e.channels || []).map(c => ({ id: c.id, name: c.name || c.id, playbackType: c.playbackType || '' })),
+        };
+    } catch (err) { return null; }
+}
+
+async function tflixGetWatchEvent(domain, watchPath) {
+    const s = await tflixH2Session(domain);
+    try {
+        const w = await s.call('GET', watchPath, TFLIX_PAGE_H);
+        if (w.status !== 200) throw new Error('صفحة المشاهدة أجابت HTTP ' + w.status);
+        const ev = tflixParseWatchBootstrap(w.body);
+        if (!ev || !ev.channels.length) throw new Error('لم يتم العثور على قنوات بث في صفحة هذه المباراة (ربما لم تُسند بعد — تظهر القنوات عند الانطلاق)');
+        ev.watchPath = watchPath;
+        return ev;
+    } finally { s.close(); }
+}
+
+// التسلسل المُثبت لفتح واجهة التشغيل: مشاهدة ← مشغّل (توكن) ← track play ← محادثة ← track view ← الإعدادات
+async function tflixExtractConfig(domain, watchPath, feedId, channelId) {
+    const s = await tflixH2Session(domain);
+    try {
+        const w = await s.call('GET', watchPath, TFLIX_PAGE_H);
+        if (w.status !== 200) throw new Error('صفحة المشاهدة أجابت HTTP ' + w.status);
+        const p = await s.call('GET', '/player/' + channelId, TFLIX_PAGE_H);
+        if (p.status !== 200) throw new Error('صفحة المشغّل أجابت HTTP ' + p.status);
+        const m = p.body.match(/PLAYBACK_AUTHORIZATION="([^"]+)"/) || p.body.match(/(\d{13}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})/);
+        if (!m) throw new Error('لم يتم العثور على توكن التشغيل في صفحة المشغّل');
+        const token = m[1];
+        const track = async (kind) => {
+            const payload = JSON.stringify({ kind, path: watchPath, referrer: '', playing: true, campaign: '' });
+            return s.call('POST', '/api/track', { ...TFLIX_FETCH_H, 'content-type': 'application/json', 'origin': 'https://' + domain, 'referer': 'https://' + domain + watchPath, 'content-length': Buffer.byteLength(payload) }, payload);
+        };
+        await track('play');
+        if (feedId) { try { await s.call('GET', '/api/chat?room=' + encodeURIComponent('event:' + feedId), { ...TFLIX_FETCH_H, 'referer': 'https://' + domain + watchPath }); } catch (e) {} }
+        await track('view');
+        const api = await s.call('GET', '/api/player/channel/' + channelId, { ...TFLIX_FETCH_H, 'x-tflix-playback': token });
+        if (api.status !== 200) throw new Error('واجهة التشغيل رفضت الطلب (' + api.status + ') — ربما لم يبدأ البث بعد');
+        const cfg = JSON.parse(api.body);
+        if (!cfg.url) throw new Error('إعدادات البث بلا رابط تشغيل');
+        let kid = '', key = '';
+        if (cfg.clearKey && cfg.clearKey.includes(':')) { const parts = cfg.clearKey.split(':'); kid = parts[0]; key = parts[1]; }
+        if (!key) throw new Error('إعدادات البث بلا مفتاح ClearKey — نوع حماية غير مدعوم');
+        return { mpdUrl: cfg.url, kid, key, type: cfg.type || 'mpd', name: cfg.name || '' };
+    } finally { s.close(); }
+}
+
+function tflixAttr(tag, name) {
+    const m = tag.match(new RegExp(name + '="([^"]*)"'));
+    return m ? m[1] : '';
+}
+
+// تحليل MPD: جودات الفيديو والصوت مع قوالب المقاطع وأرقامها ومدة المقطع
+function tflixParseMpd(xml) {
+    const out = { videos: [], audios: [] };
+    const asRe = /<AdaptationSet\b[^>]*>([\s\S]*?)<\/AdaptationSet>/g;
+    let am;
+    while ((am = asRe.exec(xml))) {
+        const asTag = am[0].slice(0, am[0].indexOf('>') + 1);
+        const mime = tflixAttr(asTag, 'mimeType');
+        const asSt = (am[1].match(/<SegmentTemplate\b[^>]*>/) || [''])[0];
+        const reps = [];
+        const repRe = /<Representation\b[^>]*>([\s\S]*?)<\/Representation>/g;
+        let rm;
+        while ((rm = repRe.exec(am[1]))) {
+            reps.push({ tag: rm[0].slice(0, rm[0].indexOf('>') + 1), stTag: (rm[1].match(/<SegmentTemplate\b[^>]*>/) || [''])[0] || asSt, inner: rm[1] });
+        }
+        if (!reps.length) {
+            const selfRe = /<Representation\b[^>]*\/>/g;
+            let sm;
+            while ((sm = selfRe.exec(am[1]))) reps.push({ tag: sm[0], stTag: asSt, inner: '' });
+        }
+        for (const r of reps) {
+            const stTag = r.stTag || asSt;
+            const tl = (r.inner.match(/<SegmentTimeline>([\s\S]*?)<\/SegmentTimeline>/) || am[1].match(/<SegmentTimeline>([\s\S]*?)<\/SegmentTimeline>/) || [])[1] || '';
+            let total = 0, segDur = 0;
+            const sRe = /<S\b[^>]*>/g;
+            let sM;
+            while ((sM = sRe.exec(tl))) {
+                total += (parseInt(tflixAttr(sM[0], 'r') || '0', 10) || 0) + 1;
+                if (!segDur) segDur = parseInt(tflixAttr(sM[0], 'd') || '0', 10);
+            }
+            const timescale = parseInt(tflixAttr(stTag, 'timescale') || '1', 10) || 1;
+            const entry = {
+                id: tflixAttr(r.tag, 'id'), bandwidth: parseInt(tflixAttr(r.tag, 'bandwidth') || '0', 10) || 0,
+                width: parseInt(tflixAttr(r.tag, 'width') || '0', 10) || 0, height: parseInt(tflixAttr(r.tag, 'height') || '0', 10) || 0,
+                codecs: tflixAttr(r.tag, 'codecs'),
+                media: tflixAttr(stTag, 'media'), init: tflixAttr(stTag, 'initialization'),
+                startNumber: parseInt(tflixAttr(stTag, 'startNumber') || '1', 10) || 1,
+                segDurSec: segDur ? segDur / timescale : 2, lastNumber: 0,
+            };
+            entry.lastNumber = entry.startNumber + Math.max(0, total - 1);
+            if (!entry.media) continue;
+            if (mime.startsWith('video')) out.videos.push(entry);
+            else if (mime.startsWith('audio')) out.audios.push(entry);
+        }
+    }
+    out.videos.sort((a, b) => (b.height - a.height) || (b.bandwidth - a.bandwidth));
+    out.audios.sort((a, b) => b.bandwidth - a.bandwidth);
+    return out;
+}
+
+// اختيار الجودة المطلوبة بالارتفاع: الأعلى الذي لا يتجاوز المطلوب، وإلا الأقرب فوقه (قاعدة .livefootball)
+function tflixPickVariant(variants, qualityHeight) {
+    if (!variants || !variants.length) return null;
+    const sorted = [...variants].sort((a, b) => a.height - b.height);
+    let best = null;
+    for (const v of sorted) if (v.height && v.height <= qualityHeight) best = v;
+    if (best) return best;
+    return sorted.find(v => v.height >= qualityHeight) || sorted[sorted.length - 1];
+}
+
+function tflixRunFfmpeg(args) {
+    return new Promise((resolve, reject) => {
+        const p = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
+        let err = '';
+        p.stderr.on('data', (d) => { err += d.toString(); });
+        p.on('error', reject);
+        p.on('close', (code) => code === 0 ? resolve() : reject(new Error('ffmpeg exit ' + code + ': ' + err.slice(-300))));
+    });
+}
+
+// مسجّل DASH: يستطلع MPD، يحمّل المقاطع الجديدة من الحافة الحية، وعند اكتمال
+// مدة كل جزء يفكّ تشفيره ويدمجه ويسلّمه عبر onPart — نسخ فقط، بلا إعادة ترميز.
+async function tflixRecordDash(opts) {
+    const { mpdUrl, keyHex, video, audio, totalSec, segmentTimeSec, dir, control, onPart } = opts;
+    const base = mpdUrl.slice(0, mpdUrl.lastIndexOf('/') + 1);
+    fs.mkdirSync(dir, { recursive: true });
+    const segUrl = (tpl, n) => base + tpl.replace('$Number$', String(n));
+    const vInit = await tflixHttpGetBuffer(base + video.init);
+    let aInit = null;
+    if (audio) { try { aInit = await tflixHttpGetBuffer(base + audio.init); } catch (e) { aInit = null; } }
+    let nextV = null, nextA = null, recordedSec = 0, partIndex = 0;
+    let vBuf = [], aBuf = [], partSec = 0;
+    let lastProgress = Date.now();
+    const startedAt = Date.now();
+    async function finalizePart(final) {
+        if (!vBuf.length) return;
+        const vcat = path.join(dir, 'vcat_' + partIndex + '.mp4');
+        const vdec = path.join(dir, 'vdec_' + partIndex + '.mp4');
+        fs.writeFileSync(vcat, Buffer.concat([vInit, ...vBuf]));
+        await tflixRunFfmpeg(['-y', '-v', 'error', '-decryption_key', keyHex, '-i', vcat, '-c', 'copy', vdec]);
+        let out = vdec;
+        if (audio && aBuf.length && aInit) {
+            const acat = path.join(dir, 'acat_' + partIndex + '.mp4');
+            const adec = path.join(dir, 'adec_' + partIndex + '.mp4');
+            const mux = path.join(dir, 'part_' + partIndex + '.mp4');
+            fs.writeFileSync(acat, Buffer.concat([aInit, ...aBuf]));
+            await tflixRunFfmpeg(['-y', '-v', 'error', '-decryption_key', keyHex, '-i', acat, '-c', 'copy', adec]);
+            await tflixRunFfmpeg(['-y', '-v', 'error', '-i', vdec, '-i', adec, '-c', 'copy', '-shortest', mux]);
+            out = mux;
+            try { fs.unlinkSync(acat); fs.unlinkSync(adec); } catch (e) {}
+        }
+        try { fs.unlinkSync(vcat); } catch (e) {}
+        const finalPath = path.join(dir, 'tflix_part_' + (partIndex + 1) + '.mp4');
+        fs.renameSync(out, finalPath);
+        if (out !== vdec) { try { fs.unlinkSync(vdec); } catch (e) {} }
+        partIndex++;
+        vBuf = []; aBuf = []; partSec = 0;
+        if (onPart) await onPart(finalPath, partIndex, final);
+    }
+    while (!control.stopped && recordedSec < totalSec) {
+        let fresh;
+        try {
+            const mpdBuf = await tflixHttpGetBuffer(mpdUrl, 15000);
+            fresh = tflixParseMpd(mpdBuf.toString('utf8'));
+        } catch (e) {
+            if (Date.now() - lastProgress > 120000) break;
+            await new Promise(r => setTimeout(r, 4000));
+            continue;
+        }
+        const fv = fresh.videos.find(v => v.id === video.id) || fresh.videos[0];
+        const fa = audio ? (fresh.audios.find(a => a.id === audio.id) || fresh.audios[0]) : null;
+        if (!fv) { await new Promise(r => setTimeout(r, 4000)); continue; }
+        if (nextV === null) { nextV = Math.max(fv.startNumber, fv.lastNumber - 1); nextA = fa ? Math.max(fa.startNumber, fa.lastNumber - 1) : null; }
+        const safeLast = fv.lastNumber - 1; // نبقى على بُعد مقطع من حافة البث المباشر
+        let downloaded = false;
+        while (nextV <= safeLast && recordedSec < totalSec && !control.stopped) {
+            try {
+                const vb = await tflixHttpGetBuffer(segUrl(fv.media, nextV), 15000);
+                vBuf.push(vb);
+                if (fa && nextA !== null) {
+                    try { const ab = await tflixHttpGetBuffer(segUrl(fa.media, nextA), 15000); aBuf.push(ab); } catch (e) {}
+                    nextA++;
+                }
+                nextV++;
+                recordedSec += fv.segDurSec;
+                partSec += fv.segDurSec;
+                downloaded = true;
+                lastProgress = Date.now();
+                if (partSec >= segmentTimeSec) await finalizePart(false);
+            } catch (e) {
+                nextV++; if (nextA !== null) nextA++; // انزلق المقطع من نافذة البث — تخطَّه
+            }
+        }
+        if (!downloaded) {
+            if (Date.now() - lastProgress > 120000) break; // توقّف البث (انتهت المباراة غالباً)
+            await new Promise(r => setTimeout(r, 3000));
+        }
+    }
+    await finalizePart(true);
+    return { recordedSec, parts: partIndex, elapsedMs: Date.now() - startedAt };
+}
+
+// بدء التسجيل الفعلي بعد اكتمال خطوات المعالج — بنفس أسلوب رسائل .livefootball
+async function tflixStartRecording(XeonBotInc, chatId, mek, job) {
+    if (activeTflixRecordings.has(chatId)) {
+        await XeonBotInc.sendMessage(chatId, {
+            text: `⚠️ يوجد تسجيل tflix نشط بالفعل في هذه المحادثة. أوقفه أولاً بأمر \`.stoptflix\` قبل بدء تسجيل جديد.`
+        }, { quoted: mek });
+        return;
+    }
+    const duration = job.duration;
+    const totalSec = duration * 60;
+    let segmentTimeSec, segmentMinutes;
+    if (job.manualSegmentMinutes !== null && job.manualSegmentMinutes !== undefined) {
+        segmentMinutes = job.manualSegmentMinutes;
+        segmentTimeSec = job.manualSegmentMinutes * 60;
+    } else {
+        const bps = ((job.videoRep.bandwidth || 0) + (job.audioRep ? (job.audioRep.bandwidth || 0) : 0)) / 8;
+        const segDur = job.videoRep.segDurSec || 2;
+        let segs = bps > 0 ? Math.round((RECORD_TARGET_MB * 1024 * 1024) / (bps * segDur)) : 30;
+        segs = Math.max(5, Math.min(segs, 900));
+        segmentTimeSec = segs * segDur;
+        segmentMinutes = Math.max(1, Math.round(segmentTimeSec / 60));
+    }
+    const tmpDir = path.join(process.cwd(), 'dltmp');
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+    const segDir = path.join(tmpDir, `tflix_${Date.now()}`);
+    fs.mkdirSync(segDir, { recursive: true });
+    await XeonBotInc.sendMessage(chatId, {
+        text: `🎙️ *بدأ تسجيل المباراة من tflix!*\n⚽ ${job.title}\n📡 القناة: ${job.channelName || ''}\n🎞️ الجودة: *${job.qualityLabel || ''}*\n⏱️ المدة الكلية: *${duration} دقيقة*\n📦 كل جزء: *~${segmentMinutes} دقيقة* (تقدير لـ ~${RECORD_TARGET_MB} MB)\n🔓 فكّ تشفير ClearKey أثناء التسجيل — بلا إعادة ترميز\n\n🛑 لإلغاء التسجيل في أي وقت: \`.stoptflix\``
+    }, { quoted: mek });
+    const control = { stopped: false };
+    activeTflixRecordings.set(chatId, control);
+    (async () => {
+        let sentParts = 0;
+        const onPart = async (filePath, idx) => {
+            try {
+                const sizeMB = (fs.statSync(filePath).size / 1024 / 1024).toFixed(2);
+                await XeonBotInc.sendMessage(chatId, {
+                    document: { url: filePath },
+                    mimetype: 'video/mp4',
+                    fileName: `Tflix_part${idx}.mp4`,
+                    caption: `📦 *الجزء ${idx}*\n⚽ ${job.title}\n📡 ${job.channelName || 'tflix'}${job.qualityLabel ? `\n🎞️ ${job.qualityLabel}` : ''}\n⚖️ ${sizeMB} MB`
+                }, { quoted: mek });
+                sentParts = idx;
+            } catch (e) {
+                await XeonBotInc.sendMessage(chatId, { text: `⚠️ فشل إرسال الجزء ${idx}: ${e.message}` }, { quoted: mek });
+            } finally {
+                try { fs.unlinkSync(filePath); } catch (_) {}
+            }
+        };
+        try {
+            const res = await tflixRecordDash({
+                mpdUrl: job.cfg.mpdUrl, keyHex: job.cfg.key,
+                video: job.videoRep, audio: job.audioRep,
+                totalSec, segmentTimeSec, dir: segDir, control, onPart
+            });
+            if (control.stopped) {
+                await XeonBotInc.sendMessage(chatId, { text: `🛑 *تم إلغاء تسجيل tflix بطلبك.*\n📦 عدد الأجزاء المُرسلة قبل الإلغاء: ${sentParts}` }, { quoted: mek });
+            } else if (res.parts === 0) {
+                await XeonBotInc.sendMessage(chatId, { text: `❌ لم تصل أي مقاطع قابلة للتسجيل من هذا البث (ربما انتهت المباراة أو توقّف البث).` }, { quoted: mek });
+            } else {
+                await XeonBotInc.sendMessage(chatId, { text: `✅ *اكتمل تسجيل المباراة من tflix!*\n⚽ ${job.title}\n📦 عدد الأجزاء المُرسلة: ${res.parts}` }, { quoted: mek });
+            }
+        } catch (err) {
+            await XeonBotInc.sendMessage(chatId, { text: `❌ خطأ في تسجيل tflix: ${err.message}` }, { quoted: mek });
+        } finally {
+            activeTflixRecordings.delete(chatId);
+            try { fs.rmSync(segDir, { recursive: true, force: true }); } catch (_) {}
+        }
+    })();
+}
+
+// خطوات ما بعد اختيار البث والجودة: مدة التسجيل ثم دقائق الجزء (تُتخطى إن أُعطيت في الأمر)
+async function tflixWizardNext(XeonBotInc, chatId, mek, job) {
+    if (job.duration === null || job.duration === undefined) {
+        const sent = await XeonBotInc.sendMessage(chatId, {
+            text: `⏱️ *كم دقيقة تريد أن أسجّل؟*\n⚽ ${job.title}\n\n💡 رد (Reply) على هذه الرسالة بعدد الدقائق (1 - 360). مثال: 100`
+        }, { quoted: mek });
+        tflixWizardCache.set(sent.key.id, { ...job, stage: 'duration' });
+        setTimeout(() => tflixWizardCache.delete(sent.key.id), 300000);
+        return;
+    }
+    if (!job.segDecided) {
+        const sent = await XeonBotInc.sendMessage(chatId, {
+            text: `📦 *كل كم دقيقة أبعث لك جزءاً من التسجيل؟*\n\n💡 رد (Reply) على هذه الرسالة بعدد الدقائق (1 - ${job.duration}). مثال: 1 تعني أن يصلك جزء جديد كل دقيقة.\nℹ️ أو رد بـ 0 للتقطيع التلقائي (~${RECORD_TARGET_MB} MB للجزء).`
+        }, { quoted: mek });
+        tflixWizardCache.set(sent.key.id, { ...job, stage: 'segment' });
+        setTimeout(() => tflixWizardCache.delete(sent.key.id), 300000);
+        return;
+    }
+    await tflixStartRecording(XeonBotInc, chatId, mek, job);
+}
+
+// بوابة التسجيل: اختيار القناة (إن تعددت) ← استخراج الإعدادات ← اختيار الجودة ← بقية الخطوات
+async function tflixBeginFlow(XeonBotInc, chatId, mek, job) {
+    if (!job.channelId) {
+        if (!job.channels || !job.channels.length) {
+            await XeonBotInc.sendMessage(chatId, { text: `❌ لا توجد قنوات بث لهذه المباراة على tflix حالياً.` }, { quoted: mek });
+            return;
+        }
+        if (job.channels.length > 1 && !job.fastPath) {
+            let cText = `📺 *اختر قناة البث:*\n⚽ ${job.title}\n\n`;
+            job.channels.forEach((c, i) => { cText += `*${i + 1}.* ${c.name}\n`; });
+            cText += `\n💡 رد (Reply) على هذه الرسالة برقم القناة خلال 5 دقائق.`;
+            const sentC = await XeonBotInc.sendMessage(chatId, { text: cText }, { quoted: mek });
+            tflixWizardCache.set(sentC.key.id, { ...job, stage: 'channel' });
+            setTimeout(() => tflixWizardCache.delete(sentC.key.id), 300000);
+            return;
+        }
+        job.channelId = job.channels[0].id;
+        job.channelName = job.channels[0].name;
+    }
+    let cfg;
+    try {
+        await XeonBotInc.sendMessage(chatId, { text: `🔎 جاري استخراج بث القناة *${job.channelName || ''}* من tflix...` }, { quoted: mek });
+        cfg = await tflixExtractConfig(job.domain, job.watchPath, job.feedId, job.channelId);
+    } catch (e) {
+        await XeonBotInc.sendMessage(chatId, { text: `❌ فشل استخراج البث:\n\`${e.message}\`` }, { quoted: mek });
+        return;
+    }
+    job.cfg = cfg;
+    let parsed;
+    try {
+        const mpdBuf = await tflixHttpGetBuffer(cfg.mpdUrl, 20000);
+        parsed = tflixParseMpd(mpdBuf.toString('utf8'));
+    } catch (e) {
+        await XeonBotInc.sendMessage(chatId, { text: `❌ تعذر قراءة قائمة تشغيل البث:\n\`${e.message}\`` }, { quoted: mek });
+        return;
+    }
+    if (!parsed.videos.length) {
+        await XeonBotInc.sendMessage(chatId, { text: `❌ قائمة تشغيل هذا البث بلا مسارات فيديو قابلة للتسجيل.` }, { quoted: mek });
+        return;
+    }
+    job.audioRep = parsed.audios[0] || null;
+    if (job.requestedQuality) {
+        const picked = tflixPickVariant(parsed.videos, job.requestedQuality);
+        job.videoRep = picked;
+        job.qualityLabel = picked && picked.height ? `${picked.height}p` : 'غير معروفة';
+        await tflixWizardNext(XeonBotInc, chatId, mek, job);
+        return;
+    }
+    if (parsed.videos.length > 1) {
+        let qText = `🎞️ *اختر جودة التسجيل:*\n⚽ ${job.title}\n📡 ${job.channelName || 'tflix'}\n\n`;
+        parsed.videos.forEach((v, i) => {
+            const bw = v.bandwidth ? ` — ~${(v.bandwidth / 1000000).toFixed(1)} Mbps` : '';
+            qText += `*${i + 1}.* ${v.height ? v.height + 'p' : 'جودة ' + (i + 1)}${v.width && v.height ? ` (${v.width}x${v.height})` : ''}${bw}\n`;
+        });
+        qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة خلال 5 دقائق، وبعدها سأسألك عن مدة التسجيل ودقائق كل جزء.`;
+        const sentQ = await XeonBotInc.sendMessage(chatId, { text: qText }, { quoted: mek });
+        tflixWizardCache.set(sentQ.key.id, { ...job, variants: parsed.videos, stage: 'quality' });
+        setTimeout(() => tflixWizardCache.delete(sentQ.key.id), 300000);
+        return;
+    }
+    job.videoRep = parsed.videos[0];
+    job.qualityLabel = parsed.videos[0].height ? `${parsed.videos[0].height}p (المتاحة فقط)` : null;
+    await tflixWizardNext(XeonBotInc, chatId, mek, job);
+}
+// ===== 🎬 .tflix — END =====
 
 // ===== ⚽ .livefootball — BEGIN =====
 // تسجيل مباريات مباشرة من مصادر بث رياضي مجمّعة (قائمة المستخدم)، بنفس منطق .record:
@@ -6525,6 +7084,65 @@ async function startXeonBotInc() {
                         return;
                     }
 
+                    // ── خطوات .tflix التفاعلية بالرد: قناة ← جودة ← مدة التسجيل ← دقائق الجزء ──
+                    if (tflixWizardCache.has(quotedId)) {
+                        const cached = tflixWizardCache.get(quotedId);
+                        const stage = cached.stage || 'quality';
+                        const job = { ...cached };
+                        delete job.variants;
+                        delete job.stage;
+                        if (stage === 'channel') {
+                            const idx = parseInt(String(replyText).trim()) - 1;
+                            if (!cached.channels || !cached.channels[idx]) {
+                                await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من قائمة القنوات.' }, { quoted: mek });
+                                return;
+                            }
+                            tflixWizardCache.delete(quotedId);
+                            job.channelId = cached.channels[idx].id;
+                            job.channelName = cached.channels[idx].name;
+                            await tflixBeginFlow(XeonBotInc, chatId, mek, job);
+                            return;
+                        }
+                        if (stage === 'quality') {
+                            const idx = parseInt(String(replyText).trim()) - 1;
+                            if (!cached.variants || !cached.variants[idx]) {
+                                await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من قائمة الجودات.' }, { quoted: mek });
+                                return;
+                            }
+                            const chosen = cached.variants[idx];
+                            tflixWizardCache.delete(quotedId);
+                            job.videoRep = chosen;
+                            job.qualityLabel = chosen.height ? `${chosen.height}p` : 'غير معروفة';
+                            await tflixWizardNext(XeonBotInc, chatId, mek, job);
+                            return;
+                        }
+                        if (stage === 'duration') {
+                            const mins = parseInt(String(replyText).trim());
+                            if (isNaN(mins) || mins < 1 || mins > 360) {
+                                await XeonBotInc.sendMessage(chatId, { text: '❌ اكتب عدد دقائق التسجيل برقم بين 1 و 360.' }, { quoted: mek });
+                                return;
+                            }
+                            tflixWizardCache.delete(quotedId);
+                            job.duration = mins;
+                            if (job.manualSegmentMinutes && job.manualSegmentMinutes > mins) job.manualSegmentMinutes = null;
+                            await tflixWizardNext(XeonBotInc, chatId, mek, job);
+                            return;
+                        }
+                        if (stage === 'segment') {
+                            const seg = parseInt(String(replyText).trim());
+                            if (isNaN(seg) || seg < 0 || seg > job.duration) {
+                                await XeonBotInc.sendMessage(chatId, { text: `❌ اكتب رقماً بين 0 و ${job.duration} (0 = تقطيع تلقائي).` }, { quoted: mek });
+                                return;
+                            }
+                            tflixWizardCache.delete(quotedId);
+                            job.segDecided = true;
+                            job.manualSegmentMinutes = seg === 0 ? null : seg;
+                            await tflixWizardNext(XeonBotInc, chatId, mek, job);
+                            return;
+                        }
+                        return;
+                    }
+
                     // ── اختيار مباراة من قايمة .football recent ──
                     if (footballCache.has(quotedId)) {
                         const cached = footballCache.get(quotedId);
@@ -7385,6 +8003,9 @@ async function startXeonBotInc() {
                     text.startsWith('.livechannel') ||
                     text.startsWith('.stoplivechannel') ||
                     text.startsWith('.stoplivefootball') ||
+                    text.startsWith('.tflix') ||
+                    text.startsWith('.stoptflix') ||
+                    text.startsWith('.settflix') ||
                     text.startsWith('.m3u') ||
                     text.startsWith('.record') ||
                     text.startsWith('.stoprecord') ||
@@ -7514,6 +8135,9 @@ async function startXeonBotInc() {
   ↳ \`.livefootball <رقم> link\` لطباعة رابط البث فقط للتشغيل — و \`.livefootballapi\` لفحص حالة المصادر
 • \`.livechannel\` — قنوات 24/7 من كل المواقع ذات القنوات (DamiTV، DaddyLive، PPV.ST وغيرها)، بنفس خطوات التسجيل — و \`.stoplivechannel\` للإيقاف — و \`.livechannelapi\` لفحص حالة مصادر القنوات
 • \`.stoplivefootball\` — إيقاف تسجيل مباراة مباشرة
+• \`.tflix\` — مباريات موقع tflix (بث مشفّر ClearKey يفكّه البوت ويسجّله): قائمة/بحث، ثم اختيار برقم وخطوات كالمعتاد (قناة ← جودة ← مدة ← جزء)
+  ↳ \`.tflix <رابط صفحة مباراة tflix>\` للتسجيل من رابط مباشر — و \`.tflix [رقم] link\` لطباعة رابط MPD ومفتاح فك التشفير — و \`.stoptflix\` للإيقاف
+  ↳ الدومين قابل للتبديل إن تغيّر عنوان الموقع: \`.tflix -domain <الدومين الجديد>\` (مثال: \`.tflix -domain tflix.su\`) — و \`.tflix -domain\` وحده يعرض الحالي
 
 📱 *أدوات*
 • \`.apk <اسم>\` — ابحث وحمّل تطبيق APK
@@ -8306,6 +8930,216 @@ async function startXeonBotInc() {
                             duration, manualSegmentMinutes, requestedQuality,
                             segDecided: manualSegmentMinutes !== null,
                             linkOnly: lfLinkOnly
+                        });
+                        return;
+                    }
+
+                    // ── أمر .stoptflix ──
+                    if (command === '.stoptflix') {
+                        const control = activeTflixRecordings.get(chatId);
+                        if (!control) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `ℹ️ لا يوجد تسجيل tflix نشط حالياً في هذه المحادثة.`
+                            }, { quoted: mek });
+                            return;
+                        }
+                        control.stopped = true;
+                        await XeonBotInc.sendMessage(chatId, {
+                            text: `🛑 جاري إلغاء تسجيل tflix... سيتم إنهاء الجزء الحالي ثم التوقف.`
+                        }, { quoted: mek });
+                        return;
+                    }
+
+                    // ── أمر .settflix — تبديل دومين tflix (صيغة بديلة عن .tflix -domain) ──
+                    if (command === '.settflix') {
+                        await tflixDomainCommand(XeonBotInc, chatId, mek, args[1] || '');
+                        return;
+                    }
+
+                    // ── أمر .tflix — مباريات tflix (بث DASH مشفّر ClearKey يفكّه البوت) ──
+                    // .tflix                            → قائمة المباريات (المباشرة أولاً ثم القادمة)
+                    // .tflix <فريق>                     → بحث داخل القائمة
+                    // .tflix <رقم> [دقائق] [جزء] [جودة] → تسجيل بخطوات تفاعلية أو باختصار كامل
+                    // .tflix <رابط مشاهدة> [دقائق]      → تسجيل من رابط صفحة مباراة tflix مباشر
+                    // .tflix [رقم|رابط] link            → طباعة رابط MPD + مفتاح ClearKey فقط
+                    // .tflix -domain <دومين>            → تبديل دومين الموقع (يُحفظ دائماً)
+                    if (command === '.tflix') {
+                        const flag1 = (args[1] || '').toLowerCase();
+                        if (flag1 === '-domain' || flag1 === '--domain' || flag1 === 'domain') {
+                            await tflixDomainCommand(XeonBotInc, chatId, mek, args[2] || '');
+                            return;
+                        }
+                        const domain = TFLIX_CONFIG.domain;
+                        const isUrlArg = !!args[1] && /^https?:\/\//i.test(args[1]);
+                        const isPickArg = !!args[1] && /^\d+$/.test(args[1]) && tflixLists.has(chatId);
+
+                        // وضع القائمة/البحث
+                        if (!isUrlArg && !isPickArg) {
+                            if (!!args[1] && /^\d+$/.test(args[1])) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `ℹ️ اعرض قائمة المباريات أولاً بأمر \`.tflix\` ثم اختر برقم: \`.tflix <رقم> [دقائق]\``
+                                }, { quoted: mek });
+                                return;
+                            }
+                            try {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: query ? `🔍 جاري البحث عن مباريات *${query}* في tflix...` : `📡 جاري جلب مباريات كرة القدم من tflix (${domain})...`
+                                }, { quoted: mek });
+                                const events = await tflixListEvents(domain);
+                                const nowMs = Date.now();
+                                let filtered = events.filter(e => e.live || (e.startsAt > nowMs && e.startsAt < nowMs + 48 * 3600 * 1000));
+                                if (query) {
+                                    const nq = footballNorm(query);
+                                    filtered = filtered.filter(e => footballNorm(e.title).includes(nq) || footballNorm(e.competition || '').includes(nq));
+                                }
+                                filtered = filtered.slice(0, 20);
+                                if (!filtered.length) {
+                                    await XeonBotInc.sendMessage(chatId, {
+                                        text: query ? `❌ لم يتم العثور على مباريات تطابق: *${query}* في tflix حالياً.` : `❌ لا توجد مباريات مباشرة أو قادمة قريباً على tflix حالياً.`
+                                    }, { quoted: mek });
+                                    return;
+                                }
+                                tflixLists.set(chatId, { events: filtered, at: Date.now() });
+                                let msg = `⚽ *مباريات tflix (${filtered.length}):*\n\n`;
+                                filtered.forEach((e, i) => {
+                                    const when = e.live
+                                        ? '🔴 مباشرة الآن'
+                                        : '🗓️ ' + new Date(e.startsAt).toLocaleString('ar-EG', { timeZone: 'Africa/Casablanca', weekday: 'short', day: 'numeric', month: 'numeric', hour: '2-digit', minute: '2-digit' });
+                                    msg += `*${i + 1}.* ${e.title}\n🏆 ${e.competition || '—'} • ${when}\n📺 ${e.channels.length} قناة\n\n`;
+                                });
+                                msg += `▶️ للتسجيل: \`.tflix [رقم]\` — وبعدها يسألك البوت خطوة بخطوة: القناة (إن تعددت)، الجودة، المدة، دقائق الجزء\n⚡ أو اختصر كل الخطوات: \`.tflix 1 100 1\` = مباراة 1، تسجيل 100 دقيقة، جزء كل دقيقة\n🔗 للرابط فقط: \`.tflix [رقم] link\`\n🌐 الدومين الحالي: ${domain} — لتبديله: \`.tflix -domain <الدومين الجديد>\``;
+                                await XeonBotInc.sendMessage(chatId, { text: msg }, { quoted: mek });
+                            } catch (e) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `❌ خطأ في جلب مباريات tflix:\n\`${e.message}\`\n\n💡 إن كان الموقع غيّر عنوانه، بدّل الدومين: \`.tflix -domain <الدومين الجديد>\``
+                                }, { quoted: mek });
+                            }
+                            return;
+                        }
+
+                        // تحليل الذيل: link / جودة مثل 720p / أرقام المدة والجزء
+                        let requestedQuality = null;
+                        let tfLinkOnly = false;
+                        const tfTail = [];
+                        for (const a of args.slice(2)) {
+                            if (/^link$/i.test(String(a)) || a === 'رابط') { tfLinkOnly = true; continue; }
+                            const qm = String(a).match(/^(\d{3,4})p$/i);
+                            if (qm && !requestedQuality) requestedQuality = parseInt(qm[1]);
+                            else tfTail.push(a);
+                        }
+
+                        let ev, jobDomain = domain;
+                        if (isPickArg) {
+                            const list = tflixLists.get(chatId).events;
+                            const pick = parseInt(args[1]);
+                            if (pick < 1 || pick > list.length) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `❌ الرقم يجب أن يكون بين 1 و ${list.length}.`
+                                }, { quoted: mek });
+                                return;
+                            }
+                            ev = list[pick - 1];
+                        } else {
+                            let u;
+                            try { u = new URL(args[1]); } catch (_) {
+                                await XeonBotInc.sendMessage(chatId, { text: `❌ رابط غير صحيح.` }, { quoted: mek });
+                                return;
+                            }
+                            jobDomain = u.hostname.replace(/^www\./, '').toLowerCase();
+                            const watchPath = u.pathname;
+                            if (!/\/watch\//.test(watchPath)) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `❌ هذا ليس رابط صفحة مباراة tflix — يجب أن يكون رابط مشاهدة يحتوي على /watch/ (انسخه من صفحة المباراة في الموقع).`
+                                }, { quoted: mek });
+                                return;
+                            }
+                            try {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `🔎 جاري قراءة بيانات المباراة من الرابط...`
+                                }, { quoted: mek });
+                                const boot = await tflixGetWatchEvent(jobDomain, watchPath);
+                                ev = { title: boot.title || 'مباراة tflix', competition: '', feedId: boot.feedId, watchPath, channels: boot.channels, live: true, startsAt: 0 };
+                                if (jobDomain !== domain) {
+                                    await XeonBotInc.sendMessage(chatId, {
+                                        text: `🌐 ملحوظة: دومين هذا الرابط (${jobDomain}) يختلف عن الدومين المضبوط (${domain}) — سأستعمل دومين الرابط لهذه المباراة. لاعتماده دائماً: \`.tflix -domain ${jobDomain}\``
+                                    }, { quoted: mek });
+                                }
+                            } catch (e) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `❌ تعذر قراءة المباراة من الرابط:\n\`${e.message}\``
+                                }, { quoted: mek });
+                                return;
+                            }
+                        }
+
+                        const duration = tfTail[0] && !isNaN(parseInt(tfTail[0])) ? parseInt(tfTail[0]) : null;
+                        let manualSegmentMinutes = tfTail[1] && !isNaN(parseInt(tfTail[1])) ? parseInt(tfTail[1]) : null;
+                        const segDecided = manualSegmentMinutes !== null;
+                        if (manualSegmentMinutes === 0) manualSegmentMinutes = null; // 0 في الأمر = تقطيع تلقائي محسوم
+
+                        if (duration !== null && (duration < 1 || duration > 360)) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `❌ المدة يجب أن تكون بين 1 و 360 دقيقة.`
+                            }, { quoted: mek });
+                            return;
+                        }
+                        if (manualSegmentMinutes !== null && (manualSegmentMinutes < 1 || (duration !== null && manualSegmentMinutes > duration))) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `❌ مدة الجزء يجب أن تكون بين 1 دقيقة والمدة الكلية.`
+                            }, { quoted: mek });
+                            return;
+                        }
+
+                        // مباراة لم تبدأ بعد: القنوات والبث يظهران عند الانطلاق فقط
+                        if (ev.startsAt && !ev.live && (ev.startsAt - Date.now() > 10 * 60 * 1000)) {
+                            const minsLeft = Math.ceil((ev.startsAt - Date.now()) / 60000);
+                            const whenStr = new Date(ev.startsAt).toLocaleString('ar-EG', { timeZone: 'Africa/Casablanca', weekday: 'long', hour: '2-digit', minute: '2-digit' });
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `⏳ *هذه المباراة لم تبدأ بعد.*\n⚽ ${ev.title}\n🕐 تبدأ: ${whenStr} (بعد ~${minsLeft} دقيقة)\n\nبث tflix يظهر عند الانطلاق. أعد المحاولة عند بداية المباراة وسيعمل الاستخراج.`
+                            }, { quoted: mek });
+                            return;
+                        }
+
+                        if (!tfLinkOnly && activeTflixRecordings.has(chatId)) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `⚠️ يوجد تسجيل tflix نشط بالفعل في هذه المحادثة. أوقفه أولاً بأمر \`.stoptflix\` قبل بدء تسجيل جديد.`
+                            }, { quoted: mek });
+                            return;
+                        }
+
+                        // وضع الرابط فقط: استخراج وطباعة MPD + مفتاح ClearKey لكل قناة (حتى 3)
+                        if (tfLinkOnly) {
+                            const chans = (ev.channels || []).slice(0, 3);
+                            if (!chans.length) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `❌ لا توجد قنوات بث لهذه المباراة على tflix حالياً (تظهر القنوات عند الانطلاق).`
+                                }, { quoted: mek });
+                                return;
+                            }
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `🔎 جاري استخراج روابط البث من tflix...`
+                            }, { quoted: mek });
+                            for (const c of chans) {
+                                try {
+                                    const cfg = await tflixExtractConfig(jobDomain, ev.watchPath, ev.feedId, c.id);
+                                    await XeonBotInc.sendMessage(chatId, {
+                                        text: `🔗 *${ev.title}*\n📺 القناة: ${c.name}\n\nرابط MPD:\n${cfg.mpdUrl}\n\n🔑 مفتاح ClearKey:\n\`${cfg.kid}:${cfg.key}\`\n\nℹ️ البث مشفّر: الرابط وحده لا يكفي في المشغّلات العادية — استعمل مشغّلاً يدعم ClearKey مع هذا المفتاح، أو سجّل من البوت مباشرة بنفس الأمر بدون كلمة link.`
+                                    }, { quoted: mek });
+                                } catch (e) {
+                                    await XeonBotInc.sendMessage(chatId, {
+                                        text: `❌ القناة ${c.name}: ${e.message}`
+                                    }, { quoted: mek });
+                                }
+                            }
+                            return;
+                        }
+
+                        await tflixBeginFlow(XeonBotInc, chatId, mek, {
+                            title: ev.title, competition: ev.competition || '',
+                            watchPath: ev.watchPath, feedId: ev.feedId,
+                            channels: ev.channels || [], domain: jobDomain,
+                            duration, manualSegmentMinutes, segDecided,
+                            requestedQuality, fastPath: duration !== null
                         });
                         return;
                     }
