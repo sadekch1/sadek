@@ -6717,10 +6717,10 @@ async function startXeonBotInc() {
                                 }, { quoted: mek });
                             } catch (e) { console.log('[>2GB] info send failed:', e && e.message); }
                             try {
-                                await XeonBotInc.sendMessage(chatId, { text: bigUrl });
+                                await XeonBotInc.sendMessage(chatId, { text: bigUrl, linkPreview: null });
                             } catch (e) {
                                 console.log('[>2GB] link send failed, retry:', e && e.message);
-                                await XeonBotInc.sendMessage(chatId, { text: '🔗 ' + bigUrl });
+                                await XeonBotInc.sendMessage(chatId, { text: '🔗 ' + bigUrl, linkPreview: null });
                             }
                             return;
                         }
