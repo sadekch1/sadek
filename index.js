@@ -1926,6 +1926,268 @@ async function tflixBeginFlow(XeonBotInc, chatId, mek, job) {
 }
 // ===== 🎬 .tflix — END =====
 
+// ===== 🏆 .footarch — BEGIN =====
+// أرشيف إعادات المباريات التاريخية — مصدر واحد: footarchives.com (مدونة Blogger)
+// القوائم والبحث من Blogger JSON feed، والروابط من جسم المنشور نفسه:
+//  • JW Player بملفات MP4 مباشرة (mediaData للأشواط / qualities لملف واحد)
+//  • أو Dailymotion iframes (منشورات كلاسيكية — تُحل عبر metadata API)
+// الإرسال يمر عبر qualityCache مثل .football (نفس آلية التحميل وحد 2GB).
+// قاعدة البيت (مثل .football): لا نتائج/أهداف في أي رسالة — تُحذف النتيجة من العنوان.
+const footarchCache = new Map();
+const FOOTARCH_BASE = 'https://www.footarchives.com';
+const FOOTARCH_UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+const FOOTARCH_MAX_LIST = 20;
+let footarchLabelsCache = null;
+
+// ── حذف النتيجة من عنوان المنشور (من غير حرق — مثل .football) ──
+function footarchCleanTitle(title) {
+    return String(title || '')
+        .replace(/\b\d{1,2}\s*[-–]\s*\d{1,2}\b/g, ' ')
+        .replace(/\s{2,}/g, ' ')
+        .replace(/\s+([،.])/g, '$1')
+        .trim();
+}
+
+// ── جلب feed واحد → منشورات [{title, url, date, labels, content}] ──
+async function footarchFeed(feedPath, maxResults) {
+    const sep = feedPath.includes('?') ? '&' : '?';
+    const url = FOOTARCH_BASE + feedPath + sep + 'alt=json&max-results=' + (maxResults || 25);
+    const res = await axios.get(url, { headers: { 'User-Agent': FOOTARCH_UA }, timeout: 35000 });
+    const feed = (res.data && res.data.feed) || {};
+    if (!footarchLabelsCache && Array.isArray(feed.category) && feed.category.length) {
+        footarchLabelsCache = feed.category.map(c => c.term).filter(Boolean);
+    }
+    const entries = Array.isArray(feed.entry) ? feed.entry : [];
+    return entries.map(e => {
+        const link = (e.link || []).find(l => l.rel === 'alternate');
+        return {
+            title: footarchCleanTitle(e.title ? e.title.$t : ''),
+            rawTitle: e.title ? e.title.$t : '',
+            url: link ? link.href : '',
+            date: e.published && e.published.$t ? e.published.$t.slice(0, 10) : '',
+            labels: (e.category || []).map(c => c.term).filter(Boolean),
+            content: e.content && e.content.$t ? e.content.$t : ''
+        };
+    }).filter(p => p.url && p.title);
+}
+
+// ── أحدث الإعادات المضافة ──
+async function footarchRecent() {
+    const posts = await footarchFeed('/feeds/posts/default?orderby=published', 25);
+    return posts.slice(0, FOOTARCH_MAX_LIST);
+}
+
+// ── بحث: لو الاستعلام يطابق وسم بطولة حرفياً نستخدم feed الوسم (مباريات نظيفة)،
+// وإلا بحث Blogger العام مع تفضيل منشورات المباريات (عنوانها فيه «مباراة») ──
+async function footarchSearch(query) {
+    const q = String(query || '').trim();
+    if (!footarchLabelsCache) { try { await footarchFeed('/feeds/posts/default', 1); } catch (_) {} }
+    if (footarchLabelsCache && footarchLabelsCache.length) {
+        const nq = footballNorm(q);
+        const label = footarchLabelsCache.find(l => footballNorm(l) === nq);
+        if (label) {
+            const posts = await footarchFeed('/feeds/posts/default/-/' + encodeURIComponent(label) + '?orderby=published', 40);
+            return { posts: posts.slice(0, FOOTARCH_MAX_LIST), viaLabel: label };
+        }
+    }
+    const raw = await footarchFeed('/feeds/posts/default?orderby=published&q=' + encodeURIComponent(q), 40);
+    const matchesOnly = raw.filter(p => p.rawTitle.includes('مباراة'));
+    return { posts: (matchesOnly.length ? matchesOnly : raw).slice(0, FOOTARCH_MAX_LIST), viaLabel: null };
+}
+
+// ── قصّ جسم المنشور من صفحة كاملة (عند غياب محتوى الـ feed) ──
+function footarchBodySlice(html) {
+    const s = String(html || '');
+    const start = s.indexOf('post-body');
+    if (start === -1) return s;
+    const rest = s.slice(start);
+    const end = rest.indexOf("id='bot-a3lan'");
+    return end > 0 ? rest.slice(0, end) : rest;
+}
+
+// ── تطبيع رابط ملف: أجزاء المسار قد تأتي عربية خاماً (من محتوى الـ feed) أو مشفّرة — نوحّدها مشفّرة ──
+function footarchFixUrl(u) {
+    try {
+        const url = new URL(u);
+        url.pathname = url.pathname.split('/').map(seg => {
+            if (!seg) return seg;
+            try { return encodeURIComponent(decodeURIComponent(seg)); } catch (_) { return encodeURIComponent(seg); }
+        }).join('/');
+        return url.href;
+    } catch (_) { return u; }
+}
+
+// ── خريطة جودات من نص كائن JS: "1080": "url" … ──
+function footarchQualityMap(text) {
+    const out = [];
+    const re = /"(\d{3,4})"\s*:\s*"(https?:[^"]+?)"/g;
+    let m;
+    while ((m = re.exec(text)) !== null) out.push({ q: parseInt(m[1], 10), url: footarchFixUrl(m[2]) });
+    out.sort((a, b) => b.q - a.q);
+    return out;
+}
+
+// ── تحليل جسم منشور → أجزاء [{label, kind:'mp4', qualities:[{q,url}]} | {label, kind:'dm', videoId}] ──
+function footarchParsePost(body) {
+    const html = String(body || '');
+    const parts = [];
+
+    // 1) mediaData: أشواط × جودات (MP4 مباشر)
+    const mdM = html.match(/mediaData\s*=\s*\{([\s\S]*?)\};/);
+    if (mdM) {
+        const labelOf = {};
+        const optRe = /<option[^>]+value="(part\d+)"[^>]*>([^<]+)</g;
+        let om;
+        while ((om = optRe.exec(html)) !== null) labelOf[om[1]] = om[2].trim();
+        const defLabel = { part1: 'الشوط الأول', part2: 'الشوط الثاني' };
+        const partRe = /(part\d+)\s*:\s*\{([^}]*)\}/g;
+        let pm;
+        while ((pm = partRe.exec(mdM[1])) !== null) {
+            const qualities = footarchQualityMap(pm[2]);
+            if (qualities.length) parts.push({ label: labelOf[pm[1]] || defLabel[pm[1]] || ('جزء ' + pm[1].replace('part', '')), kind: 'mp4', qualities });
+        }
+        if (parts.length) return parts;
+    }
+
+    // 2) qualities: ملف واحد × جودات (MP4 مباشر)
+    const qM = html.match(/qualities\s*=\s*\{([\s\S]*?)\};/);
+    if (qM) {
+        const qualities = footarchQualityMap(qM[1]);
+        if (qualities.length) return [{ label: 'المباراة كاملة', kind: 'mp4', qualities }];
+    }
+
+    // 3) Dailymotion iframes بالترتيب — الوسم النصي بين فريمين يخص الفريم الذي بعده
+    const dmRe = /<iframe[^>]+src="[^"]*?dailymotion\.com\/(?:embed\/video\/|player\/[a-z0-9]+\.html\?video=)([a-z0-9]+)/gi;
+    const hits = [];
+    let dm;
+    while ((dm = dmRe.exec(html)) !== null) hits.push({ id: dm[1], at: dm.index });
+    if (hits.length) {
+        const labelFromText = (text) => {
+            const t = String(text || '').replace(/<[^>]+>/g, ' ');
+            if (/ضربات\s*(ال)?جزاء/.test(t)) return 'ضربات الجزاء';
+            if (/(أ|ا)شواط\s*(إ|ا)ضافي/.test(t)) return 'الأشواط الإضافية';
+            if (/الشوط\s*الثاني/.test(t)) return 'الشوط الثاني';
+            if (/الشوط\s*(الأ|ا)ول/.test(t)) return 'الشوط الأول';
+            return null;
+        };
+        const defByIdx = ['الشوط الأول', 'الشوط الثاني', 'الأشواط الإضافية', 'ضربات الجزاء'];
+        hits.forEach((h, i) => {
+            let label;
+            if (hits.length === 1) label = 'المباراة كاملة';
+            else if (i === 0) label = 'الشوط الأول';
+            else {
+                const between = html.slice(hits[i - 1].at, h.at);
+                label = labelFromText(between) || defByIdx[i] || ('جزء ' + (i + 1));
+            }
+            parts.push({ label, kind: 'dm', videoId: h.id });
+        });
+        return parts;
+    }
+
+    // 4) بديل أخير: ملفات MP4 مباشرة في الجسم أو file: في إعداد المشغّل
+    const urls = [];
+    const mp4Re = /https?:\/\/[^\s"'<>]+\.mp4(?:\?[^\s"'<>]*)?/gi;
+    let um;
+    while ((um = mp4Re.exec(html)) !== null) { const fixed = footarchFixUrl(um[0]); if (!urls.includes(fixed)) urls.push(fixed); }
+    const fileM = html.match(/file\s*:\s*"(https?:[^"]+)"/);
+    if (fileM) { const fixed = footarchFixUrl(fileM[1]); if (!urls.includes(fixed)) urls.unshift(fixed); }
+    if (urls.length) {
+        const qualities = urls.map(u => {
+            const qm = u.match(/(\d{3,4})p?(?:[._-]|\.mp4)/i) || u.match(/[._-](\d{3,4})\.mp4/i);
+            return { q: qm ? parseInt(qm[1], 10) : 0, url: u };
+        }).sort((a, b) => b.q - a.q);
+        return [{ label: 'المباراة كاملة', kind: 'mp4', qualities }];
+    }
+    return [];
+}
+
+// ── جسم المنشور: من الـ feed إن وُجد، وإلا جلب الصفحة وقصّ الجسم ──
+async function footarchPostParts(post) {
+    let parts = post.content ? footarchParsePost(post.content) : [];
+    if (!parts.length) {
+        const res = await axios.get(post.url, { headers: { 'User-Agent': FOOTARCH_UA }, timeout: 35000 });
+        parts = footarchParsePost(footarchBodySlice(String(res.data)));
+    }
+    return parts;
+}
+
+// ── حجم ملف عبر GET بمدى 1 بايت (Content-Range) — لأن HEAD مرفوض عند بعض الخوادم ──
+async function footarchSizeOf(url) {
+    try {
+        const res = await axios.get(url, {
+            headers: { 'User-Agent': FOOTARCH_UA, Range: 'bytes=0-0' },
+            timeout: 15000, maxRedirects: 5, responseType: 'stream',
+            validateStatus: s => s >= 200 && s < 500
+        });
+        try { res.data.destroy(); } catch (_) {}
+        const cr = res.headers['content-range'] || '';
+        const crM = cr.match(/\/(\d+)\s*$/);
+        if (crM) return parseInt(crM[1], 10);
+        const len = parseInt(res.headers['content-length'] || '0', 10);
+        return len > 1 ? len : null;
+    } catch (_) { return null; }
+}
+
+// ── حل فيديو Dailymotion عبر metadata API → m3u8 رئيسي + مدة (null = محذوف/غير متاح) ──
+async function footarchDmMaster(videoId) {
+    const res = await axios.get('https://www.dailymotion.com/player/metadata/video/' + videoId, {
+        headers: { 'User-Agent': FOOTARCH_UA, Referer: 'https://www.dailymotion.com/' }, timeout: 25000
+    });
+    const data = res.data || {};
+    if (data.error) return null;
+    const quals = data.qualities || {};
+    let masterUrl = null;
+    for (const [k, list] of Object.entries(quals)) {
+        if (!Array.isArray(list)) continue;
+        for (const it of list) {
+            if (it && it.url && (k === 'auto' || /mpegURL/i.test(it.type || ''))) { masterUrl = it.url; break; }
+        }
+        if (masterUrl) break;
+    }
+    if (!masterUrl) return null;
+    return { masterUrl, durationSec: data.duration || null };
+}
+
+// ── تجهيز خيارات جزء واحد للتحميل: [{label, url, sizeBytes, referer}] ──
+async function footarchPartOptions(post, part) {
+    if (part.kind === 'dm') {
+        const dm = await footarchDmMaster(part.videoId);
+        if (!dm) return []; // محذوف من Dailymotion نفسه
+        try {
+            const info = await footballM3u8Info(dm.masterUrl);
+            if (info && info.variants && info.variants.length) {
+                return info.variants.map(v => ({
+                    label: '📺 Dailymotion — ' + (v.res ? v.res.split('x')[1] + 'p' : 'جودة'),
+                    url: v.url,
+                    sizeBytes: (v.bw && info.durationSec) ? Math.round(v.bw * info.durationSec / 8) : null,
+                    referer: 'https://www.dailymotion.com/'
+                }));
+            }
+        } catch (_) {}
+        return [{ label: '📺 Dailymotion — HLS', url: dm.masterUrl, sizeBytes: null, referer: 'https://www.dailymotion.com/' }];
+    }
+    const sized = await Promise.allSettled(part.qualities.map(async x => ({
+        label: '🎬 MP4 — ' + x.q + 'p',
+        url: x.url,
+        sizeBytes: await footarchSizeOf(x.url),
+        referer: post.url
+    })));
+    const out = [];
+    for (const s of sized) if (s.status === 'fulfilled') out.push(s.value);
+    return out;
+}
+
+// ── حل منشور كامل: أجزاء حية فقط (المحذوفة تُستبعد) مع خياراتها الجاهزة ──
+async function footarchResolvePost(post) {
+    const parts = await footarchPostParts(post);
+    const settled = await Promise.allSettled(parts.map(async p => ({ label: p.label, kind: p.kind, options: await footarchPartOptions(post, p) })));
+    const live = [];
+    for (const s of settled) if (s.status === 'fulfilled' && s.value.options.length) live.push(s.value);
+    return live;
+}
+// ===== 🏆 .footarch — END =====
+
+
 // ===== ⚽ .livefootball — BEGIN =====
 // تسجيل مباريات مباشرة من مصادر بث رياضي مجمّعة (قائمة المستخدم)، بنفس منطق .record:
 // فحص معدل البت → تسجيل متواصل مُجزّأ (~100MB للجزء) باتصال واحد → إرسال كل جزء فور
@@ -7263,6 +7525,81 @@ async function startXeonBotInc() {
                         return;
                     }
 
+                    // ── اختيار مباراة/شوط من قوائم .footarch ──
+                    if (footarchCache.has(quotedId)) {
+                        const cached = footarchCache.get(quotedId);
+                        const num = parseInt(String(replyText).trim());
+                        if (isNaN(num) || num < 1) {
+                            await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من القائمة.' }, { quoted: mek });
+                            return;
+                        }
+                        // تقديم خيارات جزء عبر qualityCache (نفس آلية التحميل في .football)
+                        const presentFootarchOptions = async (post, part) => {
+                            let qText = `🍿 *اختر جودة التحميل:*\n🏆 ${post.title}\n🎬 ${part.label}\n\n`;
+                            part.options.forEach((o, i) => {
+                                const sizeStr = o.sizeBytes ? fmtBytes(o.sizeBytes) : 'الحجم غير معروف';
+                                const big = o.sizeBytes && o.sizeBytes > FOOTBALL_MAX_DIRECT_BYTES ? ' ⚠️ فوق 2GB — تحميل عن بُعد' : '';
+                                qText += `*${i + 1}* - ${o.label} — ${sizeStr}${big}\n`;
+                            });
+                            qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة المطلوبة.`;
+                            const sentQ = await XeonBotInc.sendMessage(chatId, { text: qText }, { quoted: mek });
+                            qualityCache.set(sentQ.key.id, {
+                                links: part.options.map(o => o.url),
+                                names: part.options.map(o => o.label),
+                                sizes: part.options.map(o => o.sizeBytes),
+                                referers: part.options.map(o => o.referer),
+                                title: `${post.title} — ${part.label}`,
+                                referer: post.url,
+                                headers: {},
+                                football: true, // تقدّم التحميل في لوج Actions
+                                timestamp: Date.now()
+                            });
+                            setTimeout(() => qualityCache.delete(sentQ.key.id), 300000);
+                        };
+                        if (cached.stage === 'parts') {
+                            const part = cached.parts[num - 1];
+                            if (!part) {
+                                await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من القائمة.' }, { quoted: mek });
+                                return;
+                            }
+                            footarchCache.delete(quotedId);
+                            await presentFootarchOptions(cached.post, part);
+                            return;
+                        }
+                        // stage: list — اختيار مباراة من القائمة
+                        const post = cached.posts[num - 1];
+                        if (!post) {
+                            await XeonBotInc.sendMessage(chatId, { text: '❌ رقم غير صحيح، اختر رقماً من القائمة.' }, { quoted: mek });
+                            return;
+                        }
+                        footarchCache.delete(quotedId);
+                        await XeonBotInc.sendMessage(chatId, { text: `⏳ جاري تجهيز روابط *${post.title}*...` }, { quoted: mek });
+                        try {
+                            const liveParts = await footarchResolvePost(post);
+                            if (!liveParts.length) {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `⚠️ *روابط هذه المباراة غير متاحة من المصدر نفسه حالياً* (محذوفة أو موقوفة عند موقع الاستضافة).\n🏆 ${post.title}\n\n🔗 صفحة المباراة:\n${post.url}\n\n💡 جرّب مباراة أحدث — روابط المباريات القديمة تُحذف من مواقع الاستضافة مع الوقت.`
+                                }, { quoted: mek });
+                                return;
+                            }
+                            if (liveParts.length === 1) {
+                                await presentFootarchOptions(post, liveParts[0]);
+                                return;
+                            }
+                            let pText = `🏆 *${post.title}*\n\n🎬 *اختر الشوط/الجزء:*\n\n`;
+                            liveParts.forEach((p, i) => {
+                                pText += `*${i + 1}* - ${p.label} (${p.options.length} جودة)\n`;
+                            });
+                            pText += `\n💡 رد (Reply) على هذه الرسالة برقم الشوط المطلوب.`;
+                            const sentP = await XeonBotInc.sendMessage(chatId, { text: pText }, { quoted: mek });
+                            footarchCache.set(sentP.key.id, { stage: 'parts', post, parts: liveParts, timestamp: Date.now() });
+                            setTimeout(() => footarchCache.delete(sentP.key.id), 300000);
+                        } catch (err) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل تجهيز المباراة:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
                     // ── اختيار أنمي/حلقة من نتائج .anime (متعدد المصادر) ──
                     if (animeCache.has(quotedId)) {
                         const cachedData = animeCache.get(quotedId);
@@ -7976,6 +8313,7 @@ async function startXeonBotInc() {
                     text.startsWith('.apk') ||
                     text.startsWith('.anime') ||
                     text.startsWith('.football') ||
+                    text.startsWith('.footarch') ||
                     text.startsWith('.setanime') ||
                     text.startsWith('.animeset') ||
                     text.startsWith('.cartoon') ||
@@ -8080,6 +8418,8 @@ async function startXeonBotInc() {
   ↳ مثال: \`.football recent\` — رد برقم المباراة لعرض الجودات والحجم قبل التحميل
 • \`.football <فريق>\` — ابحث عن مباريات فريق من آخر 14 يوم (مثال: \`.football liverpool\`)
   ↳ لو الحجم فوق 2GB البوت هيطبع لك الرابط والحجم، وتمرّره بنفسك لـ \`.remotedl\` مع حجم الجزء اللي تختاره
+• \`.footarch <بحث>\` — أرشيف إعادات تاريخية (footarchives): ابحث بفريقين أو بطولة وسنة (مثال: \`.footarch كاس العالم 1982\`)
+  ↳ رد برقم المباراة لعرض الأشواط والجودات والحجم قبل التحميل — و\`.footarch\` لوحدها تعرض أحدث الإعادات
 
 📖 *مانجا وفيديو*
 • \`.manga <اسم>\` — ابحث وحمّل مانجا (رد برقم الفصل، أو بمدى زي \`1 5\`)
@@ -10637,6 +10977,38 @@ async function startXeonBotInc() {
                             setTimeout(() => footballCache.delete(sentMsg.key.id), 300000);
                         } catch (err) {
                             await XeonBotInc.sendMessage(chatId, { text: `❌ فشل جلب مباريات اليوم:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
+                    // ── أمر .footarch — أرشيف إعادات المباريات التاريخية (footarchives) ──
+                    if (command === '.footarch') {
+                        const presentFootarchList = async (posts, heading) => {
+                            let responseText = `🏆 *${heading}*\n\n`;
+                            posts.forEach((p, i) => {
+                                const when = p.date ? new Date(p.date + 'T00:00:00Z').toLocaleDateString('ar-EG', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Africa/Cairo' }) : '';
+                                responseText += `*${i + 1}* - ${p.title}${when ? `\n    📅 ${when}` : ''}\n`;
+                            });
+                            responseText += `\n💡 رد (Reply) على هذه الرسالة برقم المباراة لعرض الأشواط والجودات والحجم قبل التحميل.\n⏰ الرد لازم يكون خلال *5 دقايق*.`;
+                            const sentMsg = await XeonBotInc.sendMessage(chatId, { text: responseText }, { quoted: mek });
+                            footarchCache.set(sentMsg.key.id, { stage: 'list', posts, timestamp: Date.now() });
+                            setTimeout(() => footarchCache.delete(sentMsg.key.id), 300000);
+                        };
+                        try {
+                            if (!query || query.trim().toLowerCase() === 'recent') {
+                                await XeonBotInc.sendMessage(chatId, { text: '⏳ جاري جلب أحدث الإعادات من الأرشيف...' }, { quoted: mek });
+                                const posts = await footarchRecent();
+                                if (!posts.length) throw new Error('لا توجد إعادات متاحة حالياً في الأرشيف. جرّب لاحقاً.');
+                                await presentFootarchList(posts, 'أحدث إعادات الأرشيف — footarchives');
+                                return;
+                            }
+                            const term = query.trim();
+                            await XeonBotInc.sendMessage(chatId, { text: `🔍 جاري البحث في الأرشيف عن *${term}*...` }, { quoted: mek });
+                            const { posts, viaLabel } = await footarchSearch(term);
+                            if (!posts.length) throw new Error(`لا نتائج لـ "${term}" في الأرشيف. جرّب اسم الفريقين أو بطولة بسنة (مثل: كاس العالم 1982).`);
+                            await presentFootarchList(posts, viaLabel ? `مباريات ${viaLabel}` : `نتائج البحث عن: ${term}`);
+                        } catch (err) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل .footarch:\n\`${err.message}\`` }, { quoted: mek });
                         }
                         return;
                     }
