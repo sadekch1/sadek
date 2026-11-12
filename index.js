@@ -6710,9 +6710,18 @@ async function startXeonBotInc() {
                         // ── حجم أكبر من 2GB → لا تحميل مباشر ولا تمرير تلقائي؛ نطبع الرابط والحجم فقط والمستخدم يمرّره بنفسه لـ .remotedl ──
                         if (cached.sizes && cached.sizes[idx] && cached.sizes[idx] > FOOTBALL_MAX_DIRECT_BYTES) {
                             const bigUrl = cached.links[idx];
-                            await XeonBotInc.sendMessage(chatId, {
-                                text: `⚠️ *الحجم كبير جداً للتحميل المباشر!*\n📌 *العنوان:* ${cached.title || '-'}\n⚙️ *الجودة:* ${qName}\n⚖️ *الحجم:* ${fmtBytes(cached.sizes[idx])} (حد واتساب 2GB)\n\n🔗 *رابط التحميل المباشر:*\n${bigUrl}\n\n💡 مرّر الرابط بنفسك لأمر \`.remotedl\` مع حجم الجزء اللي تختاره (مثلاً 500 لأجزاء 500MB — ولازم يفضل أقل من 2000 لأن واتساب أقصى ملف 2GB).`
-                            }, { quoted: mek });
+                            console.log('[>2GB] direct-link print:', qName, fmtBytes(cached.sizes[idx]));
+                            try {
+                                await XeonBotInc.sendMessage(chatId, {
+                                    text: `⚠️ *الحجم كبير جداً للتحميل المباشر!*\n📌 *العنوان:* ${cached.title || '-'}\n⚙️ *الجودة:* ${qName}\n⚖️ *الحجم:* ${fmtBytes(cached.sizes[idx])} (حد واتساب 2GB)\n\n💡 الرابط المباشر يصلك في الرسالة التالية — مرّره بنفسك لأمر \`.remotedl\` مع حجم الجزء اللي تختاره (مثلاً 500 لأجزاء 500MB — ولازم يفضل أقل من 2000 لأن واتساب أقصى ملف 2GB).`
+                                }, { quoted: mek });
+                            } catch (e) { console.log('[>2GB] info send failed:', e && e.message); }
+                            try {
+                                await XeonBotInc.sendMessage(chatId, { text: bigUrl });
+                            } catch (e) {
+                                console.log('[>2GB] link send failed, retry:', e && e.message);
+                                await XeonBotInc.sendMessage(chatId, { text: '🔗 ' + bigUrl });
+                            }
                             return;
                         }
 
