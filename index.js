@@ -8435,6 +8435,7 @@ async function startXeonBotInc() {
                     text.startsWith('.setkdrama') ||
                     text.startsWith('.kdramaapi') ||
                     text.startsWith('.series') ||
+                    text.startsWith('.arab') ||
                     text.startsWith('.manga') ||
                     text.startsWith('.movie') ||
                     text.startsWith('.setmv') ||
@@ -8472,7 +8473,14 @@ async function startXeonBotInc() {
                     // ── أمر .ping ──
                     if (command === '.ping') {
                         const t0 = Date.now();
-                        await XeonBotInc.sendMessage(chatId, { text: `🏓 Pong!\n⏱️ ${Date.now() - t0}ms` }, { quoted: mek });
+                        const upSec = Math.floor(process.uptime());
+                        const upD = Math.floor(upSec / 86400), upH = Math.floor((upSec % 86400) / 3600), upM = Math.floor((upSec % 3600) / 60), upS = upSec % 60;
+                        const upParts = [];
+                        if (upD) upParts.push(`${upD} يوم`);
+                        if (upH) upParts.push(`${upH} ساعة`);
+                        if (upM) upParts.push(`${upM} دقيقة`);
+                        upParts.push(`${upS} ثانية`);
+                        await XeonBotInc.sendMessage(chatId, { text: `🏓 Pong!\n⏱️ زمن الرد: ${Date.now() - t0}ms\n⏳ البوت شغال منذ: ${upParts.join(' و ')}` }, { quoted: mek });
                         return;
                     }
 
@@ -8518,6 +8526,8 @@ async function startXeonBotInc() {
   ↳ مثال: \`.movie breaking bad\`
 • \`.series <اسم>\` — ابحث وحمّل مسلسل (حلقات + مدى حلقات)
   ↳ مثال: \`.series breaking bad\`
+• \`.arab <اسم>\` — ابحث وحمّل مسلسل من فرفش بلس (عربي ومدبلج)
+  ↳ مثال: \`.arab حب اسود\`
 • \`.setmv <مصدر>\` — ثبّت مصدر واحد للأفلام والمسلسلات
 • \`.mvapi\` — شوف حالة مصادر الأفلام والمسلسلات
 
@@ -8593,7 +8603,7 @@ async function startXeonBotInc() {
 • \`.sh <أمر>\` — نفّذ أمر شل (للمالك فقط)
 • \`.cwd\` — اعرض مجلد العمل الحالي
 • \`.killcmd\` — أوقف الأمر الجاري
-• \`.ping\` — افحص إن البوت شغال (بيرد Pong + زمن الرد)
+• \`.ping\` — افحص إن البوت شغال (بيرد Pong + زمن الرد + مدة التشغيل)
 • \`.help\` — اعرض هذه القائمة` }, { quoted: mek });
                         return;
                     }
@@ -11673,6 +11683,38 @@ async function lodynetEpisodeLinks(episodeUrl) {
                     }
 
                     // ── أمر .movie / .series (بحث أفلام ومسلسلات — Egywatch + ok.ru للمسلسلات فقط) ──
+                    // ── أمر .arab (فرفش بلس وحده — مسلسلات عربية ومدبلجة) ──
+                    if (command === '.arab') {
+                        if (!query) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `❌ يرجى كتابة اسم المسلسل.\n💡 *مثال:* \`.arab حب اسود\``
+                            }, { quoted: mek });
+                            return;
+                        }
+                        try {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `🔍 جاري البحث عن *${query}* في 🍿 فرفش بلس...`
+                            }, { quoted: mek });
+                            const list = await farfeshSearch(query);
+                            if (!list.length) throw new Error('لم يتم العثور على نتائج في فرفش بلس. جرّب اسماً مختلفاً.');
+                            let responseText = `📺 *نتائج البحث (فرفش بلس):*\n\n`;
+                            list.forEach((r, index) => {
+                                responseText += `*${index + 1}* - ${r.title}\n`;
+                            });
+                            responseText += `\n💡 *طريقة الاختيار:*\nقم **بالرد (Reply)** على هذه الرسالة برقم المسلسل المطلوب.\n\n🍿 *مثال:* \`1\``;
+                            const sentMsg = await XeonBotInc.sendMessage(chatId, { text: responseText }, { quoted: mek });
+                            mvCache.set(sentMsg.key.id, {
+                                stage: 'search',
+                                results: list.map(r => ({ source: 'farfesh', cdSource: null, id: r.id, type: 'series', title: r.title })),
+                                timestamp: Date.now()
+                            });
+                            setTimeout(() => mvCache.delete(sentMsg.key.id), 300000);
+                        } catch (err) {
+                            await XeonBotInc.sendMessage(chatId, { text: `❌ فشل البحث:\n\`${err.message}\`` }, { quoted: mek });
+                        }
+                        return;
+                    }
+
                     if (command === '.movie' || command === '.series') {
                         const kind = command === '.movie' ? 'movie' : 'series';
                         const kindAr = kind === 'movie' ? 'الفيلم' : 'المسلسل';
