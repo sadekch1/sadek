@@ -5223,7 +5223,7 @@ const mvCache = new Map();
 
 // ── تثبيت مصدر واحد لـ .movie / .series (عبر .setmv) ──
 let mvLockedSource = null; // null = البحث في كل المصادر
-const MV_SOURCE_LIST = ['akwam', 'cimacloud', 'meowtv', 'cinemaplus', 'viola', 'egywatch', 'okru', 'myseed'];
+const MV_SOURCE_LIST = ['akwam', 'cimacloud', 'meowtv', 'cinemaplus', 'viola', 'egywatch', 'okru', 'myseed', 'farfesh'];
 const MV_SOURCE_NAMES = {
     akwam: { source: 'akwam', label: '📺 Akwam' },
     cimacloud: { source: 'cloudday', cdSource: 'CimaCloud', label: '☁️ CloudDay (CimaCloud)' },
@@ -5233,7 +5233,8 @@ const MV_SOURCE_NAMES = {
     viola: { source: 'viola', label: '🎭 VioLa' },
     egywatch: { source: 'egywatch', label: '📺 Egywatch' },
     okru: { source: 'okru', label: '📺 ok.ru' },
-    myseed: { source: 'myseed', label: '🌱 MySeed' }
+    myseed: { source: 'myseed', label: '🌱 MySeed' },
+    farfesh: { source: 'farfesh', label: '🍿 Farfesh' }
 };
 
 // ---------- akwam: أفلام ومسلسلات ----------
@@ -5812,6 +5813,7 @@ async function resolveMvEpisodeLinks(source, cdSource, id, ep) {
     if (source === 'myseed') return { links: await myseedResolveLinks(ep.id) };
     if (source === 'dramaworld') return { links: await dramaWorldEpisodeLinks(ep) };
     if (source === 'lodynet') return { links: await lodynetEpisodeLinks(ep.id) };
+    if (source === 'farfesh') return { links: await farfeshEpisodeLinks(ep) };
     return { links: [] };
 }
 
@@ -5830,6 +5832,97 @@ async function resolveMvMovieLinks(source, cdSource, id) {
     if (source === 'okru') return { links: await okruVideoLinks(id) };
     if (source === 'myseed') return { links: await myseedResolveLinks(id) };
     return { links: [] };
+}
+
+
+// ---------- FarfeshPlus (farfeshplus): مسلسلات عربية ومدبلجة — بحث + حلقات + بث HLS ----------
+// البحث عبر نقطة اقتراحات الموقع الرسمية (POST keyword) التي تُرجع روابط SeriesV،
+// والحلقات من صفحة المسلسل على www (بطاقات vmain)، ورابط البث hls مدمج في صفحة الحلقة نفسها.
+// صفحات www بترميز windows-1256 فتُجلب كبايتات وتُفكّ صراحة.
+const FARFESH_WWW = 'https://www.farfeshplus.mosalsalatpro.online';
+const FARFESH_MOBILE = 'https://mobile.farfeshplus.mosalsalatpro.online';
+const FARFESH_HEADERS = {
+    'User-Agent': WEB_UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ar,en;q=0.5'
+};
+
+async function farfeshFetch1256(url) {
+    const res = await axios.get(url, {
+        headers: FARFESH_HEADERS,
+        timeout: 25000,
+        responseType: 'arraybuffer',
+        validateStatus: s => s < 500
+    });
+    return new TextDecoder('windows-1256').decode(res.data);
+}
+
+// بحث Farfesh: النقطة تُرجع خليط محتوى (أغاني/أفلام/أقسام) — نلتقط روابط المسلسلات فقط (SeriesV)
+async function farfeshSearch(query) {
+    const res = await axios.post(`${FARFESH_MOBILE}/s.m.farfesh/m.FarfeshGetAllseries1.asp`,
+        'keyword=' + encodeURIComponent(query), {
+            headers: { ...FARFESH_HEADERS, 'Content-Type': 'application/x-www-form-urlencoded' },
+            timeout: 20000,
+            validateStatus: s => s < 500
+        });
+    const html = String(res.data || '');
+    const found = [];
+    const regex = /<a href="?https?:\/\/mobile\.farfeshplus\.mosalsalatpro\.online\/SeriesV\d+\.asp\?Id=(\d+)"?[^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    while ((m = regex.exec(html)) !== null) {
+        const title = m[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        if (!title || found.some(r => r.id === m[1])) continue;
+        found.push({ id: m[1], title, type: 'series' });
+    }
+    // نقطة الاقتراحات تُلصق دائماً عناصر مقترحة ثابتة لا علاقة لها بالبحث — نُبقي ما يطابق كلمات البحث فقط
+    const qWords = String(query).toLowerCase().split(/\s+/).filter(w => w.length >= 2);
+    return found.filter(r => {
+        const t = r.title.toLowerCase();
+        return qWords.some(w => t.includes(w));
+    }).slice(0, 8);
+}
+
+// حلقات Farfesh: بطاقات vmain في صفحة المسلسل — رقم الحلقة داخل عنوان صورة البطاقة (IMG title).
+// التصفية بـ ZoneID ضرورية: صفحة مسلسل موقوف تردّ إلى الرئيسية المليئة بحلقات مسلسلات أخرى.
+async function farfeshEpisodes(seriesId) {
+    const html = await farfeshFetch1256(`${FARFESH_WWW}/mvid150.asp?ZoneID=${encodeURIComponent(seriesId)}`);
+    const byId = new Map();
+    const regex = /HREF="(https?:\/\/[^"]*vmain\d+\.asp\?ID=(\d+)&[^"]*)"[^>]*>\s*<IMG[^>]*?title="([^"]*)"/gi;
+    let m;
+    while ((m = regex.exec(html)) !== null) {
+        if (!m[1].includes(`ZoneID=${seriesId}`)) continue;
+        if (byId.has(m[2])) continue;
+        const title = m[3].replace(/\s+/g, ' ').trim();
+        const numMatch = title.match(/الحلقة\s*(\d+)/);
+        byId.set(m[2], { id: m[1], number: numMatch ? parseInt(numMatch[1], 10) : 0, title });
+    }
+    const eps = [...byId.values()].filter(e => e.number > 0);
+    eps.sort((a, b) => a.number - b.number);
+    return eps;
+}
+
+// روابط حلقة Farfesh: صفحة الحلقة تحمل رابط hls مباشرة (مشغّل Radiant) —
+// تُفكّ جودات البلاي ليست إن وُجدت، وإلا يُرجع الرابط الرئيسي كما هو
+async function farfeshEpisodeLinks(ep) {
+    const res = await axios.get(ep.id, {
+        headers: FARFESH_HEADERS,
+        timeout: 25000,
+        validateStatus: s => s < 500
+    });
+    const html = String(res.data || '');
+    const m = html.match(/hls:\s*'(https?:\/\/[^']+)'/) || html.match(/hls:\s*"(https?:\/\/[^"]+)"/);
+    if (!m) throw new Error('لم يتم العثور على رابط بث في صفحة الحلقة (الحلقة موقوفة عند الموقع نفسه).');
+    const master = m[1];
+    try {
+        const pl = await axios.get(master, {
+            headers: { 'User-Agent': WEB_UA, 'Referer': FARFESH_WWW + '/' },
+            timeout: 20000,
+            responseType: 'text'
+        });
+        const variants = parseM3u8Variants(String(pl.data || ''), master);
+        if (variants.length) return variants.map(v => ({ url: v.url, label: `Farfesh — ${v.label}`, referer: FARFESH_WWW + '/' }));
+    } catch (_) {}
+    return [{ url: master, label: 'Farfesh — HLS', referer: FARFESH_WWW + '/' }];
 }
 
 // بحث مصدر واحد بالاسم (نفس دوال البحث — بلا تكرار كود)
@@ -5853,6 +5946,10 @@ async function mvSearchOne(name, query, kind) {
         return await okruSearchRaw(query);
     }
     if (e.source === 'myseed') return await myseedSearch(query, kind);
+    if (e.source === 'farfesh') {
+        if (kind !== 'series') return []; // Farfesh في .series فقط
+        return await farfeshSearch(query);
+    }
     return [];
 }
 
@@ -8200,6 +8297,8 @@ async function startXeonBotInc() {
                                     await direct();
                                 } else if (selected.source === 'myseed') {
                                     await direct(); // بحث MySeed يرجع صفحات أفلام/حلقات جاهزة مباشرة (بلا قائمة حلقات)
+                                } else if (selected.source === 'farfesh') {
+                                    await showEpisodes(await farfeshEpisodes(selected.id));
                                 } else {
                                     throw new Error('مصدر غير معروف.');
                                 }
@@ -11588,7 +11687,7 @@ async function lodynetEpisodeLinks(episodeUrl) {
                             await XeonBotInc.sendMessage(chatId, {
                                 text: locked
                                     ? `🔍 جاري البحث عن *${query}* في مصدر ${locked.label} فقط...`
-                                    : `🔍 جاري البحث عن *${query}* في ${kind === 'series' ? 8 : 7} مصادر...`
+                                    : `🔍 جاري البحث عن *${query}* في ${kind === 'series' ? 9 : 7} مصادر...`
                             }, { quoted: mek });
 
                             const results = [];
@@ -11607,7 +11706,7 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                 addResults(locked.source, locked.cdSource, list, 10);
                             } else {
                                 // بحث متوازي في المصادر — فشل مصدر لا يوقف الباقي
-                                const [akwam, cdCloud, meow, cplus, viola, egyw, okru, myseed] = await Promise.allSettled([
+                                const [akwam, cdCloud, meow, cplus, viola, egyw, okru, myseed, farfesh] = await Promise.allSettled([
                                     akwamSearch(query, kind),
                                     kind === 'series' ? cloudDaySearch(query, 'CimaCloud', '2') : Promise.resolve([]),
                                     meowSearch(query, kind),
@@ -11615,7 +11714,8 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                     violaSearch(query),
                                     kind === 'series' ? egywatchSearch(query) : Promise.resolve([]),
                                     kind === 'series' ? okruSearchRaw(query) : Promise.resolve([]),
-                                    myseedSearch(query, kind)
+                                    myseedSearch(query, kind),
+                                    kind === 'series' ? farfeshSearch(query) : Promise.resolve([])
                                 ]);
                                 if (akwam.status === 'fulfilled') addResults('akwam', null, akwam.value, 3);
                                 if (cdCloud.status === 'fulfilled') addResults('cloudday', 'CimaCloud', cdCloud.value, 3);
@@ -11625,10 +11725,11 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                 if (egyw.status === 'fulfilled') addResults('egywatch', null, egyw.value, 2);
                                 if (okru.status === 'fulfilled') addResults('okru', null, okru.value.map(v => ({ id: v.id, title: v.title })), 2);
                                 if (myseed.status === 'fulfilled') addResults('myseed', null, myseed.value, 2);
+                                if (farfesh.status === 'fulfilled') addResults('farfesh', null, farfesh.value, 3);
                             }
-                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setmv <مصدر آخر>\`.` : `لم يتم العثور على أي نتائج في المصادر ${kind === 'series' ? 'الثمانية' : 'السبعة'}. جرّب اسماً مختلفاً.`);
+                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setmv <مصدر آخر>\`.` : `لم يتم العثور على أي نتائج في المصادر ${kind === 'series' ? 'التسعة' : 'السبعة'}. جرّب اسماً مختلفاً.`);
 
-                            const tagOf = s => s === 'akwam' ? '📺 Akwam' : s === 'cloudday' ? '☁️ CloudDay' : s === 'meowtv' ? '🐱 MeowTv' : s === 'cinemaplus' ? '🎬 CinemaPlus' : s === 'viola' ? '🎭 VioLa' : s === 'egywatch' ? '📺 Egywatch' : s === 'myseed' ? '🌱 MySeed' : '📺 ok.ru';
+                            const tagOf = s => s === 'akwam' ? '📺 Akwam' : s === 'cloudday' ? '☁️ CloudDay' : s === 'meowtv' ? '🐱 MeowTv' : s === 'cinemaplus' ? '🎬 CinemaPlus' : s === 'viola' ? '🎭 VioLa' : s === 'egywatch' ? '📺 Egywatch' : s === 'myseed' ? '🌱 MySeed' : s === 'farfesh' ? '🍿 Farfesh' : '📺 ok.ru';
                             let responseText = kind === 'movie' ? `🎬 *نتائج البحث (أفلام):*\n\n` : `📺 *نتائج البحث (مسلسلات):*\n\n`;
                             results.slice(0, 15).forEach((r, index) => {
                                 responseText += `*${index + 1}* - ${r.title} [${tagOf(r.source)}]\n`;
@@ -11662,7 +11763,8 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                 { name: '🎭 VioLa', fn: async () => { const r = await violaSearch('breaking bad'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
                                 { name: '📺 Egywatch', fn: async () => { const r = await egywatchSearch('star trek enterprise'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
                                 { name: '📺 ok.ru', fn: async () => { const r = await okruSearchRaw('star trek enterprise'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
-                                { name: '🌱 MySeed', fn: async () => { const r = await myseedSearch('john wick', 'movie'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
+                                { name: '🌱 MySeed', fn: async () => { const r = await myseedSearch('john wick', 'movie'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🍿 Farfesh', fn: async () => { const r = await farfeshSearch('حب اسود'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
                             ];
                             const settled = await Promise.allSettled(probes.map(async p => {
                                 const t = Date.now();
