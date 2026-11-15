@@ -1949,7 +1949,7 @@ async function redgifGetToken(force) {
 
 async function redgifSearchPage(query, page) {
     const doReq = (tk) => axios.get('https://api.redgifs.com/v2/gifs/search', {
-        params: { search_text: query, count: 20, page, order: 'trending' },
+        params: { tags: String(query).split(/[\s,]+/).filter(Boolean).join(','), type: 'g', count: 20, page, order: 'trending' },
         headers: { 'User-Agent': REDGIF_UA, 'Authorization': 'Bearer ' + tk },
         httpsAgent: redgifAgent, timeout: 25000
     });
@@ -2008,7 +2008,13 @@ async function redgifStartPump(XeonBotInc, chatId, mek, query, quality) {
             }
             totalPages = data.pages || page;
             const gifs = data.gifs || [];
-            if (!gifs.length) break;
+            if (!gifs.length) {
+                if (page === 1 && control.sent === 0) {
+                    await XeonBotInc.sendMessage(chatId, { text: `🔍 *لا توجد نتائج للبحث:* ${query}\nجرّب كلمات أبسط أو كلمة واحدة.` }, { quoted: mek }).catch(() => {});
+                    control.stopped = true;
+                }
+                break;
+            }
             for (const g of gifs) {
                 if (control.stopped || redgifSessions.get(chatId) !== control) break;
                 const urls = g.urls || {};
