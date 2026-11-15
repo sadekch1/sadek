@@ -1984,7 +1984,7 @@ async function redgifDownload(url, outPath) {
 async function redgifStartPump(XeonBotInc, chatId, mek, query, quality) {
     const prev = redgifSessions.get(chatId);
     if (prev) prev.stopped = true;
-    const control = { stopped: false, sent: 0 };
+    const control = { stopped: false, sent: 0, nextBreakAt: 14 + Math.floor(Math.random() * 10) };
     redgifSessions.set(chatId, control);
     const qLabel = quality === 'hd' ? 'HD' : 'SD';
     await XeonBotInc.sendMessage(chatId, {
@@ -2019,10 +2019,15 @@ async function redgifStartPump(XeonBotInc, chatId, mek, query, quality) {
                     await redgifDownload(fileUrl, outPath);
                     if (control.stopped || redgifSessions.get(chatId) !== control) break;
                     const sizeMB = (fs.statSync(outPath).size / 1024 / 1024).toFixed(2);
+                    try { await XeonBotInc.sendPresenceUpdate('composing', chatId); } catch (e) {}
+                    await new Promise(r => setTimeout(r, 1500 + Math.floor(Math.random() * 2000)));
                     await XeonBotInc.sendMessage(chatId, {
-                        video: { url: outPath },
+                        document: { url: outPath },
+                        mimetype: 'video/mp4',
+                        fileName: `redgif_${control.sent + 1}.mp4`,
                         caption: `🎞 *${control.sent + 1}* • ${query}\n${g.duration ? `⏱ ${Math.round(g.duration)} ثانية • ` : ''}${qLabel} • ⚖️ ${sizeMB} MB`
                     }, { quoted: mek });
+                    try { await XeonBotInc.sendPresenceUpdate('paused', chatId); } catch (e) {}
                     control.sent++;
                     failStreak = 0;
                 } catch (e) {
@@ -2032,7 +2037,13 @@ async function redgifStartPump(XeonBotInc, chatId, mek, query, quality) {
                 } finally {
                     try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
                 }
-                await new Promise(r => setTimeout(r, 1200));
+                if (control.sent >= (control.nextBreakAt || 20)) {
+                    control.nextBreakAt = control.sent + 14 + Math.floor(Math.random() * 10);
+                    const breakMs = 120000 + Math.floor(Math.random() * 180000); // 2-5 min human break
+                    for (let slept = 0; slept < breakMs && !control.stopped; slept += 5000) await new Promise(r => setTimeout(r, Math.min(5000, breakMs - slept)));
+                } else {
+                    await new Promise(r => setTimeout(r, 9000 + Math.floor(Math.random() * 9000))); // random 9-18s gap
+                }
             }
             page++;
         }
