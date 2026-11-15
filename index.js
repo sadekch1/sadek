@@ -5367,7 +5367,7 @@ const mvCache = new Map();
 
 // ── تثبيت مصدر واحد لـ .movie / .series (عبر .setmv) ──
 let mvLockedSource = null; // null = البحث في كل المصادر
-const MV_SOURCE_LIST = ['akwam', 'cimacloud', 'meowtv', 'cinemaplus', 'viola', 'egywatch', 'okru', 'myseed', 'farfesh'];
+const MV_SOURCE_LIST = ['akwam', 'cimacloud', 'meowtv', 'cinemaplus', 'viola', 'egywatch', 'okru', 'myseed', 'farfesh', 'almstba'];
 const MV_SOURCE_NAMES = {
     akwam: { source: 'akwam', label: '📺 Akwam' },
     cimacloud: { source: 'cloudday', cdSource: 'CimaCloud', label: '☁️ CloudDay (CimaCloud)' },
@@ -5378,7 +5378,8 @@ const MV_SOURCE_NAMES = {
     egywatch: { source: 'egywatch', label: '📺 Egywatch' },
     okru: { source: 'okru', label: '📺 ok.ru' },
     myseed: { source: 'myseed', label: '🌱 MySeed' },
-    farfesh: { source: 'farfesh', label: '🍿 Farfesh' }
+    farfesh: { source: 'farfesh', label: '🍿 Farfesh' },
+    almstba: { source: 'almstba', label: '📺 Al-Mastaba' }
 };
 
 // ---------- akwam: أفلام ومسلسلات ----------
@@ -5958,6 +5959,7 @@ async function resolveMvEpisodeLinks(source, cdSource, id, ep) {
     if (source === 'dramaworld') return { links: await dramaWorldEpisodeLinks(ep) };
     if (source === 'lodynet') return { links: await lodynetEpisodeLinks(ep.id) };
     if (source === 'farfesh') return { links: await farfeshEpisodeLinks(ep) };
+    if (source === 'almstba') return { links: await almstbaEpisodeLinks(ep) };
     return { links: [] };
 }
 
@@ -6069,6 +6071,139 @@ async function farfeshEpisodeLinks(ep) {
     return [{ url: master, label: 'Farfesh — HLS', referer: FARFESH_WWW + '/' }];
 }
 
+
+// ---------- Al-Mastaba (almstba): مسلسلات مدبلجة ومترجمة — بحث + حلقات + بث HLS ----------
+// بحث الموقع (ووردبريس ?s=) يُرجع منشورات حلقات منفردة — تُجمَّع هنا حسب المسلسل (العنوان بلا «الحلقة N»).
+// صفحة أي حلقة تحمل قائمة حلقات المسلسل كاملة (روابط بعناوين «... الحلقة N») — 161/161 مؤكدة لطائر الصباح مدبلج.
+// التشغيل: صفحة الحلقة ← /embed/<post_id>/ ← مشغّل liiivideo ← فكّ JS مضغوط ← master.m3u8 موقّع (يعيش 12 ساعة وغير مرتبط بـIP).
+const ALMSTBA_BASE = 'https://w8.almstba.tv';
+const ALMSTBA_HEADERS = {
+    'User-Agent': WEB_UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'ar,en;q=0.5'
+};
+
+async function almstbaFetch(url, referer) {
+    const headers = { ...ALMSTBA_HEADERS };
+    if (referer) headers.Referer = referer;
+    const res = await axios.get(url, { headers, timeout: 25000, validateStatus: s => s < 500 });
+    return String(res.data || '');
+}
+
+// رقم الحلقة من عنوان منشور: «الحلقة 25» أو «الحلقة الخامسة والعشرون (25)»
+function almstbaEpNum(title) {
+    const m = String(title || '').match(/الحلقة\s*(?:[^\d(]{0,30}\(\s*(\d+)\s*\)|(\d+))/);
+    return m ? parseInt(m[1] || m[2], 10) : 0;
+}
+
+// اسم المسلسل من عنوان حلقة: حذف «مسلسل» و«الحلقة N» وما بعدها، مع إبقاء وسم مدبلج/مترجم
+function almstbaSeriesName(title) {
+    const t = String(title || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+    const i = t.indexOf('الحلقة');
+    let base = (i >= 0 ? t.slice(0, i) : t).trim();
+    base = base.replace(/^مسلسل\s+/, '').replace(/[\s—\-:،]+$/, '').trim();
+    const marker = (t.includes('مدبلج') || t.includes('مدبلجة')) ? 'مدبلج' : ((t.includes('مترجم') || t.includes('مترجمة')) ? 'مترجم' : '');
+    if (marker && !base.includes(marker)) base = (base + ' ' + marker).trim();
+    return base;
+}
+
+// بحث Al-Mastaba: بطاقات h2.title في صفحات البحث — حلقات فقط (الأفلام بلا «الحلقة» تُستبعد)، مجمّعة حسب المسلسل.
+// التصفح ضروري: النتائج بالأحدث أولاً، فالنسخ المدبلجة الأقدم تظهر من الصفحة 2 (مؤكد: طائر الصباح ص1 كلها مترجمة، والمدبلجة ص2-3)
+async function almstbaSearch(query) {
+    const groups = new Map();
+    const regex = /<h2 class="title lineclamp"><a href="(https:\/\/w8\.almstba\.tv\/video\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    for (let page = 1; page <= 3; page++) {
+        const url = page === 1
+            ? `${ALMSTBA_BASE}/?s=${encodeURIComponent(query)}`
+            : `${ALMSTBA_BASE}/page/${page}/?s=${encodeURIComponent(query)}`;
+        const html = await almstbaFetch(url);
+        let m; let cards = 0;
+        regex.lastIndex = 0;
+        while ((m = regex.exec(html)) !== null) {
+            cards++;
+            const title = m[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+            if (!almstbaEpNum(title)) continue;
+            const name = almstbaSeriesName(title);
+            if (!name) continue;
+            const key = name.toLowerCase();
+            if (!groups.has(key)) groups.set(key, { id: m[1], title: name, type: 'series' });
+        }
+        if (!cards) break;
+    }
+    // بحث ووردبريس واسع (OR) — نُبقي ما يطابق كلمات البحث فقط (نفس قاعدة Farfesh)
+    const qWords = String(query).toLowerCase().split(/\s+/).filter(w => w.length >= 2);
+    return [...groups.values()].filter(r => {
+        const t = r.title.toLowerCase();
+        return !qWords.length || qWords.some(w => t.includes(w));
+    }).slice(0, 8);
+}
+
+// حلقات Al-Mastaba: من صفحة أي حلقة — كل الروابط المُعنونة باسم المسلسل نفسه و«الحلقة N»
+async function almstbaEpisodes(episodeUrl) {
+    const html = await almstbaFetch(episodeUrl);
+    let ownTitle = '';
+    const tm = html.match(/<title>([^<]+)<\/title>/);
+    if (tm) ownTitle = tm[1].replace(/\s*-\s*المصطبة.*$/, '').trim();
+    const seriesName = almstbaSeriesName(ownTitle);
+    const byNum = new Map();
+    const regex = /<a[^>]+href="(https:\/\/w8\.almstba\.tv\/video\/[^"]+)"[^>]*title="([^"]+)"/gi;
+    let m;
+    while ((m = regex.exec(html)) !== null) {
+        const t = m[2].replace(/\s+/g, ' ').trim();
+        const n = almstbaEpNum(t);
+        if (!n) continue;
+        if (seriesName && almstbaSeriesName(t).toLowerCase() !== seriesName.toLowerCase()) continue;
+        if (!byNum.has(n)) byNum.set(n, { id: m[1], number: n, title: t.replace(/^مسلسل\s+/, '') });
+    }
+    const eps = [...byNum.values()].sort((a, b) => a.number - b.number);
+    if (!eps.length) throw new Error('لم يتم العثور على قائمة حلقات في صفحة المسلسل.');
+    return eps;
+}
+
+// فكّ تعبئة Dean Edwards دون تنفيذ الكود: while(c--) if(k[c]) p = p.replace(/\b<c بالأساس>\b/g, k[c])
+function almstbaUnpack(script) {
+    const m = String(script || '').match(/\}\s*\(\s*'((?:[^'\\]|\\.)*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:[^'\\]|\\.)*)'\s*\.split\s*\(\s*'\|'\s*\)/s);
+    if (!m) return '';
+    const unesc = s => s.replace(/\\(.)/g, '$1');
+    let p = unesc(m[1]);
+    const radix = parseInt(m[2], 10);
+    const words = unesc(m[4]).split('|');
+    for (let c = parseInt(m[3], 10) - 1; c >= 0; c--) {
+        if (words[c]) p = p.replace(new RegExp('\\b' + c.toString(radix) + '\\b', 'g'), words[c]);
+    }
+    return p;
+}
+
+// روابط حلقة Al-Mastaba: embed الموقع ← liiivideo ← فكّ المضغوط ← master.m3u8 ← فكّ الجودات إن وُجدت
+async function almstbaEpisodeLinks(ep) {
+    const pageHtml = await almstbaFetch(ep.id);
+    const em = pageHtml.match(/https:\/\/w8\.almstba\.tv\/embed\/(\d+)\/?/);
+    if (!em) throw new Error('لم يتم العثور على مشغّل في صفحة الحلقة.');
+    const embedPage = `${ALMSTBA_BASE}/embed/${em[1]}/`;
+    const embedHtml = await almstbaFetch(embedPage, ep.id);
+    const im = embedHtml.match(/https?:\/\/[a-z0-9.]*liiivideo\.com\/embed-[a-z0-9]+\.html/i);
+    if (!im) throw new Error('لم يتم العثور على سيرفر المشاهدة.');
+    const playerUrl = im[0];
+    const playerHtml = await almstbaFetch(playerUrl, embedPage);
+    const sStart = playerHtml.indexOf('eval(function(p,a,c,k,e');
+    if (sStart < 0) throw new Error('تعذّر قراءة مشغّل الفيديو.');
+    const sEnd = playerHtml.indexOf('</script>', sStart);
+    const unpacked = almstbaUnpack(playerHtml.slice(sStart, sEnd < 0 ? undefined : sEnd));
+    const mm = unpacked.match(/https?:\/\/[^\s"'\\]+\.m3u8[^\s"'\\]*/);
+    if (!mm) throw new Error('تعذّر استخراج رابط البث من المشغّل.');
+    const master = mm[0];
+    try {
+        const pl = await axios.get(master, {
+            headers: { 'User-Agent': WEB_UA, 'Referer': playerUrl },
+            timeout: 20000,
+            responseType: 'text'
+        });
+        const variants = parseM3u8Variants(String(pl.data || ''), master);
+        if (variants.length) return variants.map(v => ({ url: v.url, label: `Al-Mastaba — ${v.label}`, referer: playerUrl }));
+    } catch (_) {}
+    return [{ url: master, label: 'Al-Mastaba — HLS', referer: playerUrl }];
+}
+
 // بحث مصدر واحد بالاسم (نفس دوال البحث — بلا تكرار كود)
 async function mvSearchOne(name, query, kind) {
     const e = MV_SOURCE_NAMES[name];
@@ -6093,6 +6228,10 @@ async function mvSearchOne(name, query, kind) {
     if (e.source === 'farfesh') {
         if (kind !== 'series') return []; // Farfesh في .series فقط
         return await farfeshSearch(query);
+    }
+    if (e.source === 'almstba') {
+        if (kind !== 'series') return []; // Al-Mastaba في .series فقط
+        return await almstbaSearch(query);
     }
     return [];
 }
@@ -8458,6 +8597,8 @@ async function startXeonBotInc() {
                                     await direct(); // بحث MySeed يرجع صفحات أفلام/حلقات جاهزة مباشرة (بلا قائمة حلقات)
                                 } else if (selected.source === 'farfesh') {
                                     await showEpisodes(await farfeshEpisodes(selected.id));
+                                } else if (selected.source === 'almstba') {
+                                    await showEpisodes(await almstbaEpisodes(selected.id));
                                 } else {
                                     throw new Error('مصدر غير معروف.');
                                 }
@@ -11934,7 +12075,7 @@ async function lodynetEpisodeLinks(episodeUrl) {
                             await XeonBotInc.sendMessage(chatId, {
                                 text: locked
                                     ? `🔍 جاري البحث عن *${query}* في مصدر ${locked.label} فقط...`
-                                    : `🔍 جاري البحث عن *${query}* في ${kind === 'series' ? 9 : 7} مصادر...`
+                                    : `🔍 جاري البحث عن *${query}* في ${kind === 'series' ? 10 : 7} مصادر...`
                             }, { quoted: mek });
 
                             const results = [];
@@ -11953,7 +12094,7 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                 addResults(locked.source, locked.cdSource, list, 10);
                             } else {
                                 // بحث متوازي في المصادر — فشل مصدر لا يوقف الباقي
-                                const [akwam, cdCloud, meow, cplus, viola, egyw, okru, myseed, farfesh] = await Promise.allSettled([
+                                const [akwam, cdCloud, meow, cplus, viola, egyw, okru, myseed, farfesh, almstba] = await Promise.allSettled([
                                     akwamSearch(query, kind),
                                     kind === 'series' ? cloudDaySearch(query, 'CimaCloud', '2') : Promise.resolve([]),
                                     meowSearch(query, kind),
@@ -11962,7 +12103,8 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                     kind === 'series' ? egywatchSearch(query) : Promise.resolve([]),
                                     kind === 'series' ? okruSearchRaw(query) : Promise.resolve([]),
                                     myseedSearch(query, kind),
-                                    kind === 'series' ? farfeshSearch(query) : Promise.resolve([])
+                                    kind === 'series' ? farfeshSearch(query) : Promise.resolve([]),
+                                    kind === 'series' ? almstbaSearch(query) : Promise.resolve([])
                                 ]);
                                 if (akwam.status === 'fulfilled') addResults('akwam', null, akwam.value, 3);
                                 if (cdCloud.status === 'fulfilled') addResults('cloudday', 'CimaCloud', cdCloud.value, 3);
@@ -11973,10 +12115,11 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                 if (okru.status === 'fulfilled') addResults('okru', null, okru.value.map(v => ({ id: v.id, title: v.title })), 2);
                                 if (myseed.status === 'fulfilled') addResults('myseed', null, myseed.value, 2);
                                 if (farfesh.status === 'fulfilled') addResults('farfesh', null, farfesh.value, 3);
+                                if (almstba.status === 'fulfilled') addResults('almstba', null, almstba.value, 3);
                             }
-                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setmv <مصدر آخر>\`.` : `لم يتم العثور على أي نتائج في المصادر ${kind === 'series' ? 'التسعة' : 'السبعة'}. جرّب اسماً مختلفاً.`);
+                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setmv <مصدر آخر>\`.` : `لم يتم العثور على أي نتائج في المصادر ${kind === 'series' ? 'العشرة' : 'السبعة'}. جرّب اسماً مختلفاً.`);
 
-                            const tagOf = s => s === 'akwam' ? '📺 Akwam' : s === 'cloudday' ? '☁️ CloudDay' : s === 'meowtv' ? '🐱 MeowTv' : s === 'cinemaplus' ? '🎬 CinemaPlus' : s === 'viola' ? '🎭 VioLa' : s === 'egywatch' ? '📺 Egywatch' : s === 'myseed' ? '🌱 MySeed' : s === 'farfesh' ? '🍿 Farfesh' : '📺 ok.ru';
+                            const tagOf = s => s === 'akwam' ? '📺 Akwam' : s === 'cloudday' ? '☁️ CloudDay' : s === 'meowtv' ? '🐱 MeowTv' : s === 'cinemaplus' ? '🎬 CinemaPlus' : s === 'viola' ? '🎭 VioLa' : s === 'egywatch' ? '📺 Egywatch' : s === 'myseed' ? '🌱 MySeed' : s === 'farfesh' ? '🍿 Farfesh' : s === 'almstba' ? '📺 Al-Mastaba' : '📺 ok.ru';
                             let responseText = kind === 'movie' ? `🎬 *نتائج البحث (أفلام):*\n\n` : `📺 *نتائج البحث (مسلسلات):*\n\n`;
                             results.slice(0, 15).forEach((r, index) => {
                                 responseText += `*${index + 1}* - ${r.title} [${tagOf(r.source)}]\n`;
@@ -12011,7 +12154,8 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                 { name: '📺 Egywatch', fn: async () => { const r = await egywatchSearch('star trek enterprise'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
                                 { name: '📺 ok.ru', fn: async () => { const r = await okruSearchRaw('star trek enterprise'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
                                 { name: '🌱 MySeed', fn: async () => { const r = await myseedSearch('john wick', 'movie'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
-                                { name: '🍿 Farfesh', fn: async () => { const r = await farfeshSearch('حب اسود'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
+                                { name: '🍿 Farfesh', fn: async () => { const r = await farfeshSearch('حب اسود'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '📺 Al-Mastaba', fn: async () => { const r = await almstbaSearch('طائر الصباح'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
                             ];
                             const settled = await Promise.allSettled(probes.map(async p => {
                                 const t = Date.now();
