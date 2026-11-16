@@ -215,8 +215,6 @@ const activeLiveChannelRecordings = new Map(); // chatId -> { proc, cancelled, s
 const activeTflixRecordings = new Map(); // chatId -> { stopped }
 const tflixWizardCache = new Map(); // sentMsgId -> job (مراحل: channel/quality/duration/segment)
 const tflixLists = new Map(); // chatId -> { events, at }
-const redgifSessions = new Map(); // chatId -> { stopped, sent } خلاصات .redgif الجارية
-const redgifWizardCache = new Map(); // sentMsgId -> { query } انتظار اختيار جودة .redgif
 
 // ── دومين tflix قابل للتبديل بأمر .settflix (يُحفظ في data/ فيبقى بعد إعادة التشغيل) ──
 const TFLIX_CONFIG_PATH = path.join(process.cwd(), 'data', 'tflix_config.json');
@@ -1199,6 +1197,162 @@ async function footballHeadSize(url) {
     } catch (_) { return null; }
 }
 
+// ===== 🖼️ بوستر مضغوط — BEGIN =====
+// عند اختيار عنوان من نتائج .anime / .series / .movie يُرسَل بوستره مضغوطاً قبل الحلقات/الجودات.
+// رابط الصورة من بيانات المصدر نفسه (حقل poster في نتائج بحثه) أو من صفحة العنوان على المصدر (og:image).
+// تُنزَّل الصورة وتُصغّر بـ ffmpeg إلى JPEG بعرض ≤540px (عادةً عشرات الكيلوبايتات) — لا تُرسَل الصورة الأصلية أبداً.
+// أي فشل في أي خطوة = تخطٍّ صامت والمتابعة بالنص كالمعتاد.
+const POSTER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+function posterRunFfmpeg(args) {
+    return new Promise((resolve) => {
+        let proc;
+        try { proc = spawn('ffmpeg', args); } catch (_) { return resolve(false); }
+        proc.on('error', () => resolve(false));
+        proc.on('close', (code) => resolve(code === 0));
+    });
+}
+
+// ضغط بافر صورة إلى JPEG صغير (≤540px، وإن بقي كبيراً ≤400px بجودة أقل) — null عند الفشل
+async function posterCompressBuffer(buf) {
+    try {
+        if (!buf || buf.length < 1000) return null;
+        const tmpDir = path.join(process.cwd(), 'dltmp');
+        if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+        const tag = 'poster_' + randomBytes(5).toString('hex');
+        const inPath = path.join(tmpDir, tag + '.src');
+        const outPath = path.join(tmpDir, tag + '.jpg');
+        const out2Path = path.join(tmpDir, tag + 'b.jpg');
+        fs.writeFileSync(inPath, buf);
+        let out = null;
+        if (await posterRunFfmpeg(['-y', '-i', inPath, '-vf', 'scale=min(540\\,iw):-2', '-q:v', '5', outPath]) && fs.existsSync(outPath)) {
+            out = fs.readFileSync(outPath);
+        }
+        if (out && out.length > 350 * 1024) {
+            if (await posterRunFfmpeg(['-y', '-i', inPath, '-vf', 'scale=min(400\\,iw):-2', '-q:v', '8', out2Path]) && fs.existsSync(out2Path)) {
+                const b2 = fs.readFileSync(out2Path);
+                if (b2.length < out.length) out = b2;
+            }
+        }
+        for (const p of [inPath, outPath, out2Path]) { try { fs.unlinkSync(p); } catch (_) {} }
+        if (!out || out.length < 800 || out.length > 900 * 1024) return null;
+        return out;
+    } catch (_) { return null; }
+}
+
+// تنزيل صورة من رابط وضغطها — null عند الفشل
+async function posterDownload(url, headers) {
+    try {
+        if (!url || !/^https?:\/\//i.test(String(url))) return null;
+        const res = await axios.get(url, {
+            headers: { 'User-Agent': POSTER_UA, ...(headers || {}) },
+            responseType: 'arraybuffer', timeout: 20000, maxContentLength: 15 * 1024 * 1024, maxRedirects: 5,
+            validateStatus: (s) => s >= 200 && s < 300
+        });
+        return await posterCompressBuffer(Buffer.from(res.data));
+    } catch (_) { return null; }
+}
+
+function posterAbsUrl(u, base) {
+    try { return new URL(String(u).replace(/&amp;/g, '&').trim(), base).toString(); } catch (_) { return null; }
+}
+
+// استخراج رابط البوستر من HTML صفحة: og:image ثم twitter:image ثم أول صورة مناسبة
+function posterExtractFromHtml(html, pageUrl) {
+    if (!html) return null;
+    const s = String(html);
+    const pats = [
+        /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+        /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+        /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+        /<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']+)["']/i
+    ];
+    for (const p of pats) {
+        const m = s.match(p);
+        if (m && m[1]) { const u = posterAbsUrl(m[1], pageUrl); if (u) return u; }
+    }
+    // صفحات بلا og:image لكنها تذكر رابط صورة TMDB كنص (CinemaPlus)
+    const bareTmdb = s.match(/https:\/\/image\.tmdb\.org\/[^\s"'<>\\]+?\.(?:jpe?g|png|webp)/i);
+    if (bareTmdb) return bareTmdb[0];
+    const imgRe = /<img[^>]+src=["']([^"']+\.(?:jpe?g|png|webp)(?:\?[^"']*)?)["']/gi;
+    let m;
+    while ((m = imgRe.exec(s)) !== null) {
+        if (/poster|cover|thumb|upload|wp-content|images/i.test(m[1]) && !/logo|icon|avatar|spinner|loading|banner-ads/i.test(m[1])) {
+            const u = posterAbsUrl(m[1], pageUrl);
+            if (u) return u;
+        }
+    }
+    return null;
+}
+
+// بوستر من صفحة عنوان على المصدر: fetchFn اختياري يجلب HTML بطريقة المصدر الخاصة، وإلا fetchText العام
+async function posterFromPage(pageUrl, fetchFn, headers) {
+    try {
+        const html = fetchFn ? await fetchFn(pageUrl) : await fetchText(pageUrl, { headers: headers || {} });
+        const img = posterExtractFromHtml(html, pageUrl);
+        if (!img) return null;
+        return await posterDownload(img, headers);
+    } catch (_) { return null; }
+}
+
+// بافر بوستر عنوان من .movie/.series (أو null)
+async function mvPosterBuffer(sel) {
+    try {
+        if (!sel) return null;
+        if (sel.poster) { const b = await posterDownload(sel.poster); if (b) return b; }
+        switch (sel.source) {
+            case 'akwam': return await posterFromPage(sel.id, (u) => akwamFetch(u));
+            case 'cinemaplus': return await posterFromPage(CPLUS_GET_HTML.replace('%s', sel.id), null, { 'User-Agent': CPLUS_UA });
+            case 'farfesh': return await posterFromPage(`${FARFESH_WWW}/mvid150.asp?ZoneID=${encodeURIComponent(sel.id)}`, (u) => farfeshFetch1256(u));
+            case 'qissa': return await posterFromPage(sel.id, (u) => qissaFetch(u));
+            case 'almstba': return await posterFromPage(sel.id, (u) => almstbaFetch(u));
+            case 'myseed': return await posterFromPage(sel.id, (u) => myseedFetch(u));
+            case 'okru': return await posterFromPage(`https://ok.ru/video/${sel.id}`, null, OKRU_PAGE_HEADERS);
+            case 'viola': return await posterFromPage(`${VIOLA_BASE}/watch.php?vid=${sel.id}`, null, VIOLA_HEADERS);
+            default:
+                if (/^https?:\/\//i.test(String(sel.id))) return await posterFromPage(sel.id);
+                return null;
+        }
+    } catch (_) { return null; }
+}
+
+// بافر بوستر عنوان من .anime (أو null)
+async function animePosterBuffer(sel) {
+    try {
+        if (!sel) return null;
+        if (sel.poster) { const b = await posterDownload(sel.poster); if (b) return b; }
+        switch (sel.source) {
+            case 'okru': return await posterFromPage(`https://ok.ru/video/${sel.id}`, null, OKRU_PAGE_HEADERS);
+            case 'animezid': return await posterFromPage(`${AZ_API}/series/${encodeURIComponent(sel.id)}`);
+            case 'okanime': return await posterFromPage(`${OKANIME_API}/anime/${encodeURIComponent(sel.id)}`);
+            default:
+                if (/^https?:\/\//i.test(String(sel.id))) return await posterFromPage(sel.id);
+                return null;
+        }
+    } catch (_) { return null; }
+}
+
+// وسام المصدر لعنوان الكابشن
+function posterTagMV(sel) {
+    try {
+        for (const k of Object.keys(MV_SOURCE_NAMES)) {
+            const e = MV_SOURCE_NAMES[k];
+            if (e && e.source === sel.source && (e.cdSource || null) === (sel.cdSource || null)) return e.label || sel.source;
+        }
+    } catch (_) {}
+    return sel.source || '';
+}
+function posterTagAnime(sel) {
+    try {
+        for (const k of Object.keys(ANIME_SOURCE_NAMES)) {
+            const e = ANIME_SOURCE_NAMES[k];
+            if (e && e.source === sel.source && (e.cdSource || null) === (sel.cdSource || null)) return e.label || sel.source;
+        }
+    } catch (_) {}
+    return sel.source || '';
+}
+// ===== 🖼️ بوستر مضغوط — END =====
+
 // ── تقدير حجم روابط الجودة قبل التحميل (قوائم MV): دقيق للملفات المباشرة عبر HEAD،
 // وتقريبي للبث HLS عبر ضرب متوسط حجم مقاطع عيّنة في مدة الحلقة الكاملة ──
 const MV_SIZE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -2001,147 +2155,6 @@ async function tflixBeginFlow(XeonBotInc, chatId, mek, job) {
 }
 // ===== 🎬 .tflix — END =====
 
-// ===== 🔞 .redgif — BEGIN =====
-// خلاصة فيديوهات RedGIFs لتطبيق TikGon: بحث بأي عبارة ← سؤال جودة واحد (HD/SD) ← ضخّ متواصل فيديو بعد فيديو حتى الإيقاف.
-// الـAPI: توكن مؤقت من /v2/auth/temporary (مربوط بعنوان الطالب — على GitHub Actions العنوان ثابت طوال التشغيل فلا مشكلة)،
-// والبحث /v2/gifs/search?search_text=..&page=N يرجّع روابط MP4 مباشرة (hd/sd) + المدة. كل الطلبات عبر Agent واحد مثبّت الاتصال.
-const REDGIF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-const redgifAgent = new https.Agent({ keepAlive: true, maxSockets: 4 });
-let redgifTokenCache = { token: '', at: 0 };
-
-async function redgifGetToken(force) {
-    if (!force && redgifTokenCache.token && Date.now() - redgifTokenCache.at < 25 * 60 * 1000) return redgifTokenCache.token;
-    const res = await axios.get('https://api.redgifs.com/v2/auth/temporary', {
-        headers: { 'User-Agent': REDGIF_UA }, httpsAgent: redgifAgent, timeout: 20000
-    });
-    const token = res.data && res.data.token;
-    if (!token) throw new Error('لم يرجع الموقع توكن دخول');
-    redgifTokenCache = { token, at: Date.now() };
-    return token;
-}
-
-async function redgifSearchPage(query, page) {
-    const doReq = (tk) => axios.get('https://api.redgifs.com/v2/gifs/search', {
-        params: { tags: String(query).split(/[\s,]+/).filter(Boolean).join(','), type: 'g', count: 20, page, order: 'trending' },
-        headers: { 'User-Agent': REDGIF_UA, 'Authorization': 'Bearer ' + tk },
-        httpsAgent: redgifAgent, timeout: 25000
-    });
-    try {
-        const res = await doReq(await redgifGetToken(false));
-        return res.data || {};
-    } catch (e) {
-        if (e.response && e.response.status === 401) {
-            const res = await doReq(await redgifGetToken(true));
-            return res.data || {};
-        }
-        throw e;
-    }
-}
-
-async function redgifDownload(url, outPath) {
-    const res = await axios.get(url, {
-        responseType: 'stream',
-        headers: { 'User-Agent': REDGIF_UA },
-        httpsAgent: redgifAgent, timeout: 180000, maxRedirects: 5
-    });
-    await new Promise((resolve, reject) => {
-        const ws = fs.createWriteStream(outPath);
-        res.data.pipe(ws);
-        res.data.on('error', reject);
-        ws.on('finish', resolve);
-        ws.on('error', reject);
-    });
-}
-
-// بدء خلاصة في محادثة (تستبدل أي خلاصة جارية فيها): تضخّ النتائج صفحة بعد صفحة حتى الإيقاف أو نفاد النتائج
-async function redgifStartPump(XeonBotInc, chatId, mek, query, quality) {
-    const prev = redgifSessions.get(chatId);
-    if (prev) prev.stopped = true;
-    const control = { stopped: false, sent: 0, nextBreakAt: 14 + Math.floor(Math.random() * 10) };
-    redgifSessions.set(chatId, control);
-    const qLabel = quality === 'hd' ? 'HD' : 'SD';
-    await XeonBotInc.sendMessage(chatId, {
-        text: `🎬 *TikGon feed:* ${query} [${qLabel}]\n🔍 بدأت الخلاصة — سأرسل الفيديوهات واحداً تلو الآخر بلا توقف.\n🛑 للإيقاف: \`.stopredgif\``
-    }, { quoted: mek });
-    const tmpDir = path.join(process.cwd(), 'dltmp');
-    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-    let failStreak = 0;
-    try {
-        let page = 1;
-        let totalPages = 1;
-        while (!control.stopped && redgifSessions.get(chatId) === control && page <= totalPages) {
-            let data;
-            try {
-                data = await redgifSearchPage(query, page);
-            } catch (e) {
-                failStreak++;
-                if (failStreak >= 3) throw new Error('فشل جلب نتائج البحث 3 مرات متتالية: ' + e.message);
-                await new Promise(r => setTimeout(r, 3000));
-                continue;
-            }
-            totalPages = data.pages || page;
-            const gifs = data.gifs || [];
-            if (!gifs.length) {
-                if (page === 1 && control.sent === 0) {
-                    await XeonBotInc.sendMessage(chatId, { text: `🔍 *لا توجد نتائج للبحث:* ${query}\nجرّب كلمات أبسط أو كلمة واحدة.` }, { quoted: mek }).catch(() => {});
-                    control.stopped = true;
-                }
-                break;
-            }
-            for (const g of gifs) {
-                if (control.stopped || redgifSessions.get(chatId) !== control) break;
-                const urls = g.urls || {};
-                const fileUrl = quality === 'hd' ? (urls.hd || urls.sd) : (urls.sd || urls.hd);
-                if (!fileUrl) continue;
-                const outPath = path.join(tmpDir, `rg_${randomBytes(5).toString('hex')}.mp4`);
-                try {
-                    await redgifDownload(fileUrl, outPath);
-                    if (control.stopped || redgifSessions.get(chatId) !== control) break;
-                    const sizeMB = (fs.statSync(outPath).size / 1024 / 1024).toFixed(2);
-                    try { await XeonBotInc.sendPresenceUpdate('composing', chatId); } catch (e) {}
-                    await new Promise(r => setTimeout(r, 1500 + Math.floor(Math.random() * 2000)));
-                    await XeonBotInc.sendMessage(chatId, {
-                        document: { url: outPath },
-                        mimetype: 'video/mp4',
-                        fileName: `redgif_${control.sent + 1}.mp4`,
-                        caption: `🎞 *${control.sent + 1}* • ${query}\n${g.duration ? `⏱ ${Math.round(g.duration)} ثانية • ` : ''}${qLabel} • ⚖️ ${sizeMB} MB`
-                    }, { quoted: mek });
-                    try { await XeonBotInc.sendPresenceUpdate('paused', chatId); } catch (e) {}
-                    control.sent++;
-                    failStreak = 0;
-                } catch (e) {
-                    failStreak++;
-                    console.log('[REDGIF] download/send failed:', e && e.message);
-                    if (failStreak >= 5) throw new Error('فشل إرسال 5 فيديوهات متتالية — آخر خطأ: ' + e.message);
-                } finally {
-                    try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
-                }
-                if (control.sent >= (control.nextBreakAt || 20)) {
-                    control.nextBreakAt = control.sent + 14 + Math.floor(Math.random() * 10);
-                    const breakMs = 120000 + Math.floor(Math.random() * 180000); // 2-5 min human break
-                    for (let slept = 0; slept < breakMs && !control.stopped; slept += 5000) await new Promise(r => setTimeout(r, Math.min(5000, breakMs - slept)));
-                } else {
-                    await new Promise(r => setTimeout(r, 9000 + Math.floor(Math.random() * 9000))); // random 9-18s gap
-                }
-            }
-            page++;
-        }
-        if (redgifSessions.get(chatId) === control && !control.stopped) {
-            await XeonBotInc.sendMessage(chatId, {
-                text: `🏁 *انتهت نتائج البحث* عن: ${query}\n📦 مجموع ما أُرسل: ${control.sent} فيديو.`
-            }, { quoted: mek });
-        }
-    } catch (e) {
-        if (redgifSessions.get(chatId) === control) {
-            await XeonBotInc.sendMessage(chatId, {
-                text: `❌ توقّفت خلاصة RedGIFs:\n\`${e.message}\`\n📦 أُرسل قبل التوقف: ${control.sent} فيديو.`
-            }, { quoted: mek });
-        }
-    } finally {
-        if (redgifSessions.get(chatId) === control) redgifSessions.delete(chatId);
-    }
-}
-// ===== 🔞 .redgif — END =====
 
 // ===== 📁 .gofile — BEGIN =====
 // تنزيل من GoFile بدون أي حساب: توكن ضيف مجهول يُنشأ وقت الطلب + توقيع موقع (X-Website-Token).
@@ -3867,7 +3880,7 @@ async function cloudDaySearch(query, srcName, type = '0') {
         new URLSearchParams({ title: query, type, sort: '1', page: '1' }).toString(),
         { headers: { 'User-Agent': CLOUDDAY_UA, 'Accept': 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 20000 });
     const results = Array.isArray(res.data && res.data.results) ? res.data.results : [];
-    return results.map(r => ({ id: String(r.id), type: r.type || 'series', name: r.name || r.title || '' }));
+    return results.map(r => ({ id: String(r.id), type: r.type || 'series', name: r.name || r.title || '', poster: r.poster || null }));
 }
 
 // حلقات مسلسل CloudDay → [{id, number, title}]
@@ -4486,7 +4499,7 @@ async function witcherSearch(query) {
     const res = await axios.post(`https://${appId}-dsn.algolia.net/1/indexes/series/query`, { params },
         { timeout: 20000, headers: { 'X-Algolia-Application-Id': appId, 'X-Algolia-API-Key': apiKey, 'User-Agent': 'Algolia for Android (3.27.0); Android (16)', 'Content-Type': 'application/json' } });
     const hits = Array.isArray(res.data?.hits) ? res.data.hits : [];
-    return hits.filter(h => h && h.name).map(h => ({ id: String(h.objectID), title: h.name }));
+    return hits.filter(h => h && h.name).map(h => ({ id: String(h.objectID), title: h.name, poster: h.poster_uri || (h.poster && h.poster.medium) || null }));
 }
 
 async function witcherEpisodes(objectId) {
@@ -5799,6 +5812,7 @@ async function meowSearch(query, kind) {
     return list.filter(r => r.media_type === want).slice(0, 10).map(r => ({
         id: String(r.id),
         title: `${r.title || r.name || ''}${r.release_date || r.first_air_date ? ` (${String(r.release_date || r.first_air_date).slice(0, 4)})` : ''}`.trim(),
+        poster: r.poster_path ? 'https://image.tmdb.org/t/p/w500' + r.poster_path : null,
         type: want === 'movie' ? 'movie' : 'series'
     }));
 }
@@ -6145,7 +6159,7 @@ async function egywatchSearch(query) {
     const list = (data && data.search) || [];
     return list
         .filter(x => /serie/i.test(String(x.type || '')))
-        .map(x => ({ id: String(x.id), title: x.name, type: 'series' }))
+        .map(x => ({ id: String(x.id), title: x.name, type: 'series', poster: x.poster_path || null }))
         .slice(0, 5);
 }
 
@@ -6422,7 +6436,7 @@ async function movieboxSearch(query, kind) {
     for (const it of items) {
         if (!it || !it.subjectId || !it.title) continue;
         if (it.subjectType && it.subjectType !== want) continue;
-        out.push({ id: String(it.subjectId), title: String(it.title), type: kind });
+        out.push({ id: String(it.subjectId), title: String(it.title), type: kind, poster: (it.cover && it.cover.url) || null });
         if (out.length >= 8) break;
     }
     return out;
@@ -8342,21 +8356,6 @@ async function startXeonBotInc() {
                     }
 
                     // ── خطوات .tflix التفاعلية بالرد: قناة ← جودة ← مدة التسجيل ← دقائق الجزء ──
-                    // ── اختيار جودة خلاصة .redgif ──
-                    if (redgifWizardCache.has(quotedId)) {
-                        const cached = redgifWizardCache.get(quotedId);
-                        const pick = String(replyText).trim().toLowerCase();
-                        let quality = null;
-                        if (pick === '1' || pick === 'hd') quality = 'hd';
-                        else if (pick === '2' || pick === 'sd') quality = 'sd';
-                        if (!quality) {
-                            await XeonBotInc.sendMessage(chatId, { text: '❌ رد برقم الجودة: 1 لـ HD أو 2 لـ SD.' }, { quoted: mek });
-                            return;
-                        }
-                        redgifWizardCache.delete(quotedId);
-                        await redgifStartPump(XeonBotInc, chatId, mek, cached.query, quality);
-                        return;
-                    }
                     if (tflixWizardCache.has(quotedId)) {
                         const cached = tflixWizardCache.get(quotedId);
                         const stage = cached.stage || 'quality';
@@ -8656,6 +8655,7 @@ async function startXeonBotInc() {
                                     text: `⏳ جاري استخراج الجودات لـ\n*${selected.title}*...`
                                 }, { quoted: mek });
                                 try {
+                                    try { const pb = await animePosterBuffer(selected); if (pb) await XeonBotInc.sendMessage(chatId, { image: pb, caption: `🎬 *${selected.title}*\n${posterTagAnime(selected)}` }, { quoted: mek }); } catch (_) {}
                                     const { title, videos } = await extractOkruVideo(`https://ok.ru/video/${selected.id}`);
                                     const links = videos.map(v => v.url);
                                     const names = videos.map(v => OKRU_QUALITY_LABELS[v.name] || v.name || 'غير معروفة');
@@ -8686,6 +8686,7 @@ async function startXeonBotInc() {
                                     text: `⏳ جاري استخراج الجودات لـ\n*${selected.title}*...`
                                 }, { quoted: mek });
                                 try {
+                                    try { const pb = await animePosterBuffer(selected); if (pb) await XeonBotInc.sendMessage(chatId, { image: pb, caption: `🎬 *${selected.title}*\n${posterTagAnime(selected)}` }, { quoted: mek }); } catch (_) {}
                                     const links = await egyaflamEpisodeLinks(selected.id);
                                     if (!links.length) throw new Error('لا توجد روابط تحميل متاحة.');
                                     let qText = `🍿 *اختر جودة التحميل:*\n🎬 ${selected.title}\n\n`;
@@ -8717,6 +8718,7 @@ async function startXeonBotInc() {
                                 // الفيلم في CloudDay: السيرفرات مباشرة بدون حلقات
                                 if (selected.source === 'cloudday' && selected.type === 'movie') {
                                     const base = await cloudDayResolveBase(CLOUDDAY_SOURCES.find(s => s.name === selected.cdSource));
+                                    try { const pb = await animePosterBuffer(selected); if (pb) await XeonBotInc.sendMessage(chatId, { image: pb, caption: `🎬 *${selected.title}*\n${posterTagAnime(selected)}` }, { quoted: mek }); } catch (_) {}
                                     const links = await cloudDayServers(base, 'movie', selected.id);
                                     const resolved = await cloudDayResolveLinks(links);
                                     if (!resolved.length) throw new Error('لا توجد روابط تحميل متاحة لهذا الفيلم.');
@@ -8763,6 +8765,20 @@ async function startXeonBotInc() {
                                     episodes = await okanimeEpisodes(selected.id);
                                 }
                                 if (!episodes.length) throw new Error('لا توجد حلقات.');
+                                // 🖼️ بوستر مضغوط: إن نجح يكون هو رسالة اختيار الحلقة (الاسم + المصدر + عدد الحلقات فقط)، وإلا النص كالمعتاد
+                                try {
+                                    const pb = await animePosterBuffer(selected);
+                                    if (pb) {
+                                        const sentP = await XeonBotInc.sendMessage(chatId, { image: pb, caption: `📺 *${selected.title}*\n${posterTagAnime(selected)}\n🔢 عدد الحلقات: ${episodes.length}\n\n💡 رد (Reply) على هذه الرسالة برقم الحلقة، أو بمدى مثل 1-15 لتحميل عدة حلقات دفعة واحدة.` }, { quoted: mek });
+                                        animeCache.set(sentP.key.id, {
+                                            stage: 'episodes', source: selected.source, cdSource: selected.cdSource,
+                                            animeId: selected.id, title: selected.title, episodes,
+                                            timestamp: Date.now()
+                                        });
+                                        setTimeout(() => animeCache.delete(sentP.key.id), 300000);
+                                        return;
+                                    }
+                                } catch (_) {}
                                 let epText = `📺 *${selected.title}*\n🔢 عدد الحلقات: ${episodes.length}\n\n`;
                                 episodes.slice(0, 10).forEach(e => {
                                     epText += `*${e.number}* - ${e.title || ('الحلقة ' + e.number)}\n`;
@@ -9155,6 +9171,7 @@ async function startXeonBotInc() {
                                 // فيلم مباشر (أو فيديو واحد) → الجودات مباشرة
                                 const direct = async () => {
                                     const resolved = await resolveMvMovieLinks(selected.source, selected.cdSource, selected.id);
+                                    try { const pb = await mvPosterBuffer(selected); if (pb) await XeonBotInc.sendMessage(chatId, { image: pb, caption: `🎬 *${selected.title}*\n${posterTagMV(selected)}` }, { quoted: mek }); } catch (_) {}
                                     if (!resolved.links.length) throw new Error('لا توجد روابط تحميل متاحة.');
                                     await mvAttachSizes(resolved.links);
                                     let qText = `🍿 *اختر جودة التحميل:*\n🎬 ${selected.title}\n\n`;
@@ -9176,6 +9193,20 @@ async function startXeonBotInc() {
                                 // مسلسل → قائمة الحلقات
                                 const showEpisodes = async (episodes) => {
                                     if (!episodes.length) throw new Error('لا توجد حلقات.');
+                                    // 🖼️ بوستر مضغوط: إن نجح يكون هو رسالة اختيار الحلقة (الاسم + المصدر + عدد الحلقات فقط)، وإلا النص كالمعتاد
+                                    try {
+                                        const pb = await mvPosterBuffer(selected);
+                                        if (pb) {
+                                            const sentP = await XeonBotInc.sendMessage(chatId, { image: pb, caption: `📺 *${selected.title}*\n${posterTagMV(selected)}\n🔢 عدد الحلقات: ${episodes.length}\n\n💡 رد (Reply) على هذه الرسالة برقم الحلقة، أو بمدى مثل 1-15 لتحميل عدة حلقات دفعة واحدة.` }, { quoted: mek });
+                                            mvCache.set(sentP.key.id, {
+                                                stage: 'episodes', source: selected.source, cdSource: selected.cdSource,
+                                                mvId: selected.id, title: selected.title, episodes,
+                                                timestamp: Date.now()
+                                            });
+                                            setTimeout(() => mvCache.delete(sentP.key.id), 300000);
+                                            return;
+                                        }
+                                    } catch (_) {}
                                     let epText = `📺 *${selected.title}*\n🔢 عدد الحلقات: ${episodes.length}\n\n`;
                                     episodes.slice(0, 10).forEach(e => {
                                         epText += `*${e.number}* - ${e.title || ('الحلقة ' + e.number)}\n`;
@@ -9388,8 +9419,6 @@ async function startXeonBotInc() {
                     text.startsWith('.tflix') ||
                     text.startsWith('.stoptflix') ||
                     text.startsWith('.settflix') ||
-                    text.startsWith('.redgif') ||
-                    text.startsWith('.stopredgif') ||
                     text.startsWith('.m3u') ||
                     text.startsWith('.record') ||
                     text.startsWith('.stoprecord') ||
@@ -9533,7 +9562,6 @@ async function startXeonBotInc() {
 • \`.livechannel\` — قنوات 24/7 من كل المواقع ذات القنوات (DamiTV، DaddyLive، PPV.ST وغيرها)، بنفس خطوات التسجيل — و \`.stoplivechannel\` للإيقاف — و \`.livechannelapi\` لفحص حالة مصادر القنوات
 • \`.stoplivefootball\` — إيقاف تسجيل مباراة مباشرة
 • \`.tflix\` — مباريات موقع tflix (بث مشفّر ClearKey يفكّه البوت ويسجّله): قائمة/بحث، ثم اختيار برقم وخطوات كالمعتاد (قناة ← جودة ← مدة ← جزء)
-• \`.redgif <بحث>\` — خلاصة فيديوهات RedGIFs (لتطبيق TikGon): أي كلمات بحث، يسألك عن الجودة مرة واحدة (HD/SD) ثم يضخّ الفيديوهات واحداً تلو الآخر بلا توقف — و\`.stopredgif\` للإيقاف
   ↳ \`.tflix <رابط صفحة مباراة tflix>\` للتسجيل من رابط مباشر — و \`.tflix [رقم] link\` لطباعة رابط MPD ومفتاح فك التشفير — و \`.stoptflix\` للإيقاف
   ↳ الدومين قابل للتبديل إن تغيّر عنوان الموقع: \`.tflix -domain <الدومين الجديد>\` (مثال: \`.tflix -domain tflix.su\`) — و \`.tflix -domain\` وحده يعرض الحالي
 
@@ -10345,49 +10373,6 @@ async function startXeonBotInc() {
                         await XeonBotInc.sendMessage(chatId, {
                             text: `🛑 جاري إلغاء تسجيل tflix... سيتم إنهاء الجزء الحالي ثم التوقف.`
                         }, { quoted: mek });
-                        return;
-                    }
-
-                    // ── أمر .stopredgif — إيقاف خلاصة RedGIFs الجارية ──
-                    if (command === '.stopredgif') {
-                        const s = redgifSessions.get(chatId);
-                        if (s) {
-                            s.stopped = true;
-                            redgifSessions.delete(chatId);
-                            await XeonBotInc.sendMessage(chatId, {
-                                text: `🛑 *توقّفت خلاصة RedGIFs.*\n📦 مجموع ما أُرسل: ${s.sent || 0} فيديو.`
-                            }, { quoted: mek });
-                        } else {
-                            await XeonBotInc.sendMessage(chatId, {
-                                text: `ℹ️ لا توجد خلاصة RedGIFs جارية في هذه المحادثة.`
-                            }, { quoted: mek });
-                        }
-                        return;
-                    }
-
-                    // ── أمر .redgif — خلاصة RedGIFs لتطبيق TikGon ──
-                    // .redgif <بحث>        → يسأل عن الجودة مرة واحدة ثم يضخّ الفيديوهات بلا توقف
-                    // .redgif <بحث> hd|sd  → يبدأ فوراً بالجودة المكتوبة في آخر الأمر
-                    if (command === '.redgif') {
-                        let q = query.trim();
-                        if (!q) {
-                            await XeonBotInc.sendMessage(chatId, {
-                                text: `🔞 *خلاصة RedGIFs (TikGon)*\n\nالاستعمال: \`.redgif <كلمات البحث>\`\nمثال: \`.redgif asian ass\`\n\nيسألك البوت عن الجودة مرة واحدة (HD/SD) ثم يرسل الفيديوهات واحداً تلو الآخر بلا توقف.\n⚡ اختصار: أضف hd أو sd في آخر الأمر ليبدأ فوراً بلا سؤال.\n🛑 الإيقاف: \`.stopredgif\``
-                            }, { quoted: mek });
-                            return;
-                        }
-                        let quality = null;
-                        const qm = q.match(/\s+(hd|sd)$/i);
-                        if (qm) { quality = qm[1].toLowerCase(); q = q.slice(0, qm.index).trim(); }
-                        if (quality) {
-                            await redgifStartPump(XeonBotInc, chatId, mek, q, quality);
-                            return;
-                        }
-                        const sentQ = await XeonBotInc.sendMessage(chatId, {
-                            text: `🎞 *اختر جودة الخلاصة:*\n🔍 البحث: *${q}*\n\n*1.* HD — أعلى جودة (ملفات كبيرة: ~32 MB للفيديو)\n*2.* SD — خفيفة وسريعة (~5 MB — الأنسب لخلاصة سلسة بلا انتظار)\n\n💡 رد (Reply) على هذه الرسالة برقم الجودة خلال 5 دقائق — تُطبَّق على كل فيديوهات هذه الخلاصة.`
-                        }, { quoted: mek });
-                        redgifWizardCache.set(sentQ.key.id, { query: q });
-                        setTimeout(() => redgifWizardCache.delete(sentQ.key.id), 300000);
                         return;
                     }
 
@@ -11998,7 +11983,7 @@ async function startXeonBotInc() {
                                     const key = String(it.title || '').trim().toLowerCase();
                                     if (!key || seenTitles.has(key)) continue;
                                     seenTitles.add(key);
-                                    results.push({ source, cdSource, id: it.id, type: it.type || 'series', title: it.title });
+                                    results.push({ source, cdSource, id: it.id, type: it.type || 'series', title: it.title, poster: it.poster || null });
                                 }
                             };
                             if (locked) {
@@ -12765,7 +12750,7 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                     const key = String(it.title || '').trim().toLowerCase();
                                     if (!key || seenTitles.has(key)) continue;
                                     seenTitles.add(key);
-                                    results.push({ source, cdSource, id: it.id, type: it.type || 'series', title: it.title });
+                                    results.push({ source, cdSource, id: it.id, type: it.type || 'series', title: it.title, poster: it.poster || null });
                                 }
                             };
                             if (locked) {
@@ -12914,7 +12899,7 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                     const key = String(it.title || '').trim().toLowerCase();
                                     if (!key || seenTitles.has(key)) continue;
                                     seenTitles.add(key);
-                                    results.push({ source, cdSource, id: it.id, type: 'series', title: it.title });
+                                    results.push({ source, cdSource, id: it.id, type: 'series', title: it.title, poster: it.poster || null });
                                 }
                             };
                             if (locked) {
