@@ -2094,7 +2094,7 @@ async function gofileGuestToken() {
         try {
             const res = await axios.post(`${GOFILE_API}/accounts`, {}, {
                 headers: { 'User-Agent': GOFILE_UA, 'Content-Type': 'application/json' },
-                timeout: 20000, validateStatus: () => true
+                timeout: 30000, validateStatus: () => true
             });
             if (res.data && res.data.status === 'ok' && res.data.data && res.data.data.token) return res.data.data.token;
             lastErr = new Error('gofile رفض إنشاء توكن ضيف (' + ((res.data && res.data.status) || res.status) + ')');
@@ -2164,8 +2164,9 @@ async function gofileCollectFiles(token, rootId, password) {
     return files;
 }
 
-// تحميل ملف واحد وإرساله: توكن ورابط طازجان وقت التحميل نفسه، والحجم فوق 2GB يطبع صفحة الرابط
-async function gofileSendFile(sock, chatId, mek, fileRef, password, pageUrl) {
+// تحميل ملف واحد وإرساله: توكن ورابط طازجان وقت التحميل نفسه.
+// الإرسال دائماً بأجزاء متتابعة عبر gofileSendParts (قرار المستخدم: لا دمج عند البوت — الدمج عنده).
+async function gofileSendFile(sock, chatId, mek, fileRef, password, pageUrl, partMB = 0) {
     const token = await gofileGuestToken();
     let link = '', name = fileRef.name || 'file', size = fileRef.size || 0;
     const data = await gofileFetchContents(token, fileRef.id, password);
@@ -2176,39 +2177,46 @@ async function gofileSendFile(sock, chatId, mek, fileRef, password, pageUrl) {
         if (hit) { link = hit.link; name = hit.name || name; size = hit.size || size; }
     }
     if (!link) throw new Error('تعذر استخراج رابط التحميل المباشر من gofile.');
-    if (size > FOOTBALL_MAX_DIRECT_BYTES) {
-        await gofileSendParts(sock, chatId, mek, fileRef, password, pageUrl, token, link, name, size);
+    await sock.sendMessage(chatId, { text: `⚡ *بدأ تحميل:* ${name}` }, { quoted: mek });
+    if (!size) {
+        // حجم غير معروف من gofile — تنزيل مباشر عادي كخطة احتياطية (لا يمكن التقطيع بلا حجم)
+        const tmpDir = path.join(process.cwd(), 'dltmp');
+        if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+        let result;
+        try {
+            result = await smartDownloadUrl(link, tmpDir, 'GoFile', { 'Cookie': 'accountToken=' + token });
+            const safeName = String(name).replace(/[\\/:*?"<>|]/g, '_').slice(0, 120) || ('GoFile' + result.fileExt);
+            await sock.sendMessage(chatId, {
+                document: { url: result.outputPath },
+                mimetype: result.mimeType,
+                fileName: safeName,
+                caption: `✅ *اكتمل التحميل!*\n📌 *الملف:* ${name}\n⚖️ *الحجم:* ${result.sizeMB} MB\n☁️ المصدر: GoFile`
+            }, { quoted: mek });
+        } finally {
+            if (result && result.outputPath && fs.existsSync(result.outputPath)) {
+                try { fs.unlinkSync(result.outputPath); } catch (_) {}
+            }
+        }
         return;
     }
-    const tmpDir = path.join(process.cwd(), 'dltmp');
-    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-    await sock.sendMessage(chatId, { text: `⚡ *بدأ تحميل:* ${name}` }, { quoted: mek });
-    let result;
-    try {
-        result = await smartDownloadUrl(link, tmpDir, 'GoFile', { 'Cookie': 'accountToken=' + token });
-        const safeName = String(name).replace(/[\\/:*?"<>|]/g, '_').slice(0, 120) || ('GoFile' + result.fileExt);
-        await sock.sendMessage(chatId, {
-            document: { url: result.outputPath },
-            mimetype: result.mimeType,
-            fileName: safeName,
-            caption: `✅ *اكتمل التحميل!*\n📌 *الملف:* ${name}\n⚖️ *الحجم:* ${result.sizeMB} MB\n☁️ المصدر: GoFile`
-        }, { quoted: mek });
-    } finally {
-        if (result && result.outputPath && fs.existsSync(result.outputPath)) {
-            try { fs.unlinkSync(result.outputPath); } catch (_) {}
-        }
-    }
+    const partBytes = (partMB >= 1 && partMB <= 1900) ? partMB * 1048576 : GOFILE_PART_BYTES;
+    await gofileSendParts(sock, chatId, mek, fileRef, password, pageUrl, token, link, name, size, partBytes);
 }
-// إرسال ملف أكبر من حد واتساب: أجزاء متتابعة (تنزيل نطاقي)، يُرسل كل جزء ويُحذف فوراً
-const GOFILE_PART_BYTES = 1000 * 1048576; // ~1000MB — تحت حد واتساب 2GB بهامش أمان
+// الإرسال بأجزاء متتابعة (تنزيل نطاقي): يُنزّل الجزء، يُرسل، يُمسح من القرص، ثم الجزء الذي يليه.
+// البوت لا يدمج الأجزاء أبداً — الدمج عند المستخدم (قراره الصريح 2026-11-16).
+// التنزيل التسلسلي المتحقق من حجم كل جزء يتفادى قطعَ gofile للاتصالات المتوازية الذي أنقص ملفاً حياً إلى 25%.
+const GOFILE_PART_BYTES = 500 * 1048576; // ~500MB للجزء الواحد
 
-async function gofileSendParts(sock, chatId, mek, fileRef, password, pageUrl, firstToken, firstLink, name, size) {
-    const totalParts = Math.ceil(size / GOFILE_PART_BYTES);
+async function gofileSendParts(sock, chatId, mek, fileRef, password, pageUrl, firstToken, firstLink, name, size, partBytes) {
+    const PB = partBytes || GOFILE_PART_BYTES;
+    const totalParts = Math.ceil(size / PB);
     const tmpDir = path.join(process.cwd(), 'dltmp');
     if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-    await sock.sendMessage(chatId, {
-        text: `📦 *الملف كبير:* ${name}\n⚖️ *الحجم:* ${fmtBytes(size)} — أكبر من حد واتساب (2GB)\n🧩 سيُنزّل ويُرسل في *${totalParts} أجزاء* (كل جزء ~1000MB)، وتُدمج الأجزاء بالترتيب لاسترجاع الملف الأصلي.`
-    }, { quoted: mek });
+    if (totalParts > 1) {
+        await sock.sendMessage(chatId, {
+            text: `🧩 *${name}*\n⚖️ *الحجم:* ${fmtBytes(size)}\nسيُنزّل ويُرسل في *${totalParts} أجزاء* (كل جزء ~${Math.round(PB / 1048576)}MB): يُنزّل الجزء ويُرسل ثم يُمسح من القرص، وبعده الجزء الذي يليه.\n💡 ادمج الأجزاء بالترتيب لاسترجاع الملف الأصلي.`
+        }, { quoted: mek });
+    }
     let token = firstToken, link = firstLink;
     const headers = () => ({ 'User-Agent': GOFILE_UA, 'Cookie': 'accountToken=' + token, 'Accept-Encoding': 'identity' });
     const safeBase = String(name).replace(/[\\/:*?"<>|]/g, '_').slice(0, 110) || 'GoFile';
@@ -2216,8 +2224,8 @@ async function gofileSendParts(sock, chatId, mek, fileRef, password, pageUrl, fi
     let sent = 0;
     try {
         for (let i = 0; i < totalParts; i++) {
-            const start = i * GOFILE_PART_BYTES;
-            const end = Math.min(start + GOFILE_PART_BYTES - 1, size - 1);
+            const start = i * PB;
+            const end = Math.min(start + PB - 1, size - 1);
             const expect = end - start + 1;
             const partPath = path.join(tmpDir, `gfpart_${randomBytes(4).toString('hex')}`);
             let okPart = false;
@@ -2241,8 +2249,10 @@ async function gofileSendParts(sock, chatId, mek, fileRef, password, pageUrl, fi
                 await sock.sendMessage(chatId, {
                     document: { url: partPath },
                     mimetype: 'application/octet-stream',
-                    fileName: `${safeBase}.part${String(i + 1).padStart(2, '0')}`,
-                    caption: `🧩 *الجزء ${i + 1} من ${totalParts}* — ${name}`
+                    fileName: totalParts === 1 ? safeBase : `${safeBase}.part${String(i + 1).padStart(2, '0')}`,
+                    caption: totalParts === 1
+                        ? `✅ *اكتمل التحميل!*\n📌 *الملف:* ${name}\n⚖️ *الحجم:* ${fmtBytes(size)}\n☁️ المصدر: GoFile`
+                        : `🧩 *الجزء ${i + 1} من ${totalParts}* — ${name}`
                 }, { quoted: mek });
                 sent++;
             } finally {
@@ -2258,9 +2268,11 @@ async function gofileSendParts(sock, chatId, mek, fileRef, password, pageUrl, fi
     } finally {
         tracker.stop();
     }
-    await sock.sendMessage(chatId, {
-        text: `✅ *اكتمل إرسال كل الأجزاء (${sent}/${totalParts})* — ${name}\n💡 ادمج الأجزاء بالترتيب (part01 ثم part02...) لاسترجاع الملف الأصلي.`
-    }, { quoted: mek });
+    if (totalParts > 1) {
+        await sock.sendMessage(chatId, {
+            text: `✅ *اكتمل إرسال كل الأجزاء (${sent}/${totalParts})* — ${name}\n💡 ادمج الأجزاء بالترتيب (part01 ثم part02...) لاسترجاع الملف الأصلي.`
+        }, { quoted: mek });
+    }
 }
 // ===== 📁 .gofile — END =====
 
@@ -8214,7 +8226,7 @@ async function startXeonBotInc() {
                         }
                         gofileCache.delete(quotedId);
                         try {
-                            await gofileSendFile(XeonBotInc, chatId, mek, fileRef, cached.password, cached.pageUrl);
+                            await gofileSendFile(XeonBotInc, chatId, mek, fileRef, cached.password, cached.pageUrl, cached.partMB || 0);
                         } catch (err) {
                             await XeonBotInc.sendMessage(chatId, { text: `❌ فشل تحميل الملف:\n\`${err.message}\`` }, { quoted: mek });
                         }
@@ -9059,7 +9071,7 @@ async function startXeonBotInc() {
 • \`.footarch <بحث>\` — أرشيف إعادات تاريخية (footarchives): ابحث بفريقين أو بطولة وسنة (مثال: \`.footarch كاس العالم 1982\`)
   ↳ رد برقم المباراة لعرض الأشواط والجودات والحجم قبل التحميل — و\`.footarch\` لوحدها تعرض أحدث الإعادات
 • \`.gofile <رابط>\` — حمّل ملف أو مجلد من GoFile (بدون حساب)
-  ↳ مثال: \`.gofile https://gofile.io/d/xxxxxx\` — ولو الرابط فيه أكثر من ملف، رد برقم الملف لتحميله
+  ↳ مثال: \`.gofile https://gofile.io/d/xxxxxx\` — يُرسل بأجزاء (الافتراضي 500MB؛ غيّره برقم بعد الرابط مثل 1000)، ولو فيه أكثر من ملف رد برقم الملف
 
 📖 *مانجا وفيديو*
 • \`.manga <اسم>\` — ابحث وحمّل مانجا (رد برقم الفصل، أو بمدى زي \`1 5\`)
@@ -11031,12 +11043,17 @@ async function startXeonBotInc() {
                         const gfMatch = urlArg.match(/gofile\.io\/d\/([A-Za-z0-9]+)/) || urlArg.match(/^([A-Za-z0-9]{6,})$/);
                         if (!gfMatch) {
                             await XeonBotInc.sendMessage(chatId, {
-                                text: '❌ الصيغة خاطئة!\n`.gofile [رابط GoFile]`\nمثال: `.gofile https://gofile.io/d/xxxxxx`\nوإذا كان الرابط محمياً: `.gofile [الرابط] [كلمة السر]`'
+                                text: '❌ الصيغة خاطئة!\n`.gofile [رابط GoFile]`\nمثال: `.gofile https://gofile.io/d/xxxxxx`\nمع حجم جزء: `.gofile [الرابط] 1000` (1–1900 MB، الافتراضي 500)\nوإذا كان الرابط محمياً: `.gofile [الرابط] [كلمة السر] [حجم الجزء]`'
                             }, { quoted: mek });
                             return;
                         }
                         const contentId = gfMatch[1];
-                        const password = parts[1] || '';
+                        // وسائط ما بعد الرابط: رقم (1–1900) = حجم الجزء MB، وأي نص آخر = كلمة السر
+                        let password = '', partMB = 0;
+                        for (const a of parts.slice(1)) {
+                            if (/^\d+$/.test(a)) { const n = parseInt(a); if (n >= 1 && n <= 1900) partMB = n; }
+                            else if (!password) password = a;
+                        }
                         const pageUrl = 'https://gofile.io/d/' + contentId;
                         try {
                             await XeonBotInc.sendMessage(chatId, { text: '⏳ جاري جلب ملفات الرابط من GoFile...' }, { quoted: mek });
@@ -11047,14 +11064,14 @@ async function startXeonBotInc() {
                                 return;
                             }
                             if (files.length === 1) {
-                                await gofileSendFile(XeonBotInc, chatId, mek, files[0], password, pageUrl);
+                                await gofileSendFile(XeonBotInc, chatId, mek, files[0], password, pageUrl, partMB);
                                 return;
                             }
                             let listText = `📁 *GoFile — ${files.length} ملف:*\n\n`;
                             files.forEach((f, i) => { listText += `*${i + 1}* - ${f.name} — ${f.size ? fmtBytes(f.size) : 'الحجم غير معروف'}\n`; });
                             listText += `\n💡 رد (Reply) على هذه الرسالة برقم الملف لتحميله.\n⏰ الرد لازم يكون خلال *5 دقايق*.`;
                             const sentMsg = await XeonBotInc.sendMessage(chatId, { text: listText }, { quoted: mek });
-                            gofileCache.set(sentMsg.key.id, { files: files.map(f => ({ id: f.id, name: f.name, size: f.size })), password, pageUrl, timestamp: Date.now() });
+                            gofileCache.set(sentMsg.key.id, { files: files.map(f => ({ id: f.id, name: f.name, size: f.size })), password, pageUrl, partMB, timestamp: Date.now() });
                             setTimeout(() => gofileCache.delete(sentMsg.key.id), 300000);
                         } catch (err) {
                             await XeonBotInc.sendMessage(chatId, { text: `❌ فشل .gofile:\n\`${err.message}\`` }, { quoted: mek });
