@@ -5573,7 +5573,7 @@ const mvCache = new Map();
 
 // ── تثبيت مصدر واحد لـ .movie / .series (عبر .setmv) ──
 let mvLockedSource = null; // null = البحث في كل المصادر
-const MV_SOURCE_LIST = ['akwam', 'cimacloud', 'meowtv', 'cinemaplus', 'viola', 'egywatch', 'okru', 'myseed', 'farfesh', 'almstba'];
+const MV_SOURCE_LIST = ['akwam', 'cimacloud', 'meowtv', 'cinemaplus', 'viola', 'egywatch', 'okru', 'myseed', 'farfesh', 'almstba', 'moviebox'];
 const MV_SOURCE_NAMES = {
     akwam: { source: 'akwam', label: '📺 Akwam' },
     cimacloud: { source: 'cloudday', cdSource: 'CimaCloud', label: '☁️ CloudDay (CimaCloud)' },
@@ -5585,7 +5585,8 @@ const MV_SOURCE_NAMES = {
     okru: { source: 'okru', label: '📺 ok.ru' },
     myseed: { source: 'myseed', label: '🌱 MySeed' },
     farfesh: { source: 'farfesh', label: '🍿 Farfesh' },
-    almstba: { source: 'almstba', label: '📺 Al-Mastaba' }
+    almstba: { source: 'almstba', label: '📺 Al-Mastaba' },
+    moviebox: { source: 'moviebox', label: '🎬 MovieBox' }
 };
 
 // ---------- akwam: أفلام ومسلسلات ----------
@@ -6166,6 +6167,7 @@ async function resolveMvEpisodeLinks(source, cdSource, id, ep) {
     if (source === 'lodynet') return { links: await lodynetEpisodeLinks(ep.id) };
     if (source === 'farfesh') return { links: await farfeshEpisodeLinks(ep) };
     if (source === 'almstba') return { links: await almstbaEpisodeLinks(ep) };
+    if (source === 'moviebox') { const [mbSid, mbSe, mbEp] = String(ep.id).split('|'); return await movieboxLinks(mbSid, parseInt(mbSe) || 1, parseInt(mbEp) || 1); }
     return { links: [] };
 }
 
@@ -6183,9 +6185,177 @@ async function resolveMvMovieLinks(source, cdSource, id) {
     if (source === 'viola') return { links: await violaEpisodeLinks(id) };
     if (source === 'okru') return { links: await okruVideoLinks(id) };
     if (source === 'myseed') return { links: await myseedResolveLinks(id) };
+    if (source === 'moviebox') return await movieboxLinks(id, 0, 0);
     return { links: [] };
 }
 
+
+// ---------- MovieBox (moviebox): أفلام ومسلسلات عالمية عبر واجهة تطبيق الأندرويد (aoneroom) ----------
+// بحث + مواسم/حلقات + ملفات MP4 مباشرة من قائمة الموارد (resource) + ترجمة عربية خارجية تُدمج عند التحميل.
+// الواجهة تتطلب توقيعاً (X-Client-Token + x-tr-signature HMAC-MD5 بمفاتيح التطبيق) وتوكن زائر يُحصَد
+// من ترويسة x-user في أول رد — لذا نطلب الصفحة الرئيسية أولاً (البحث المباشر يفشل 441 miss token).
+const MB_HOSTS = ['https://api.inmoviebox.com', 'https://api4sg.aoneroom.com', 'https://api6sg.aoneroom.com', 'https://api6.aoneroom.com', 'https://api5.aoneroom.com', 'https://api4.aoneroom.com', 'https://api3.aoneroom.com'];
+const MB_SECRET_DEFAULT = '76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O';
+const MB_RETRY = new Set([403, 407, 429, 440, 500, 502, 503, 504]);
+const MB_UA = 'com.community.oneroom/50020044 (Linux; U; Android 12; en_US; 2201117TG; Build/S1B.220414.015; Cronet/135.0.7012.3)';
+const MB_CLIENT_INFO = JSON.stringify({ package_name: 'com.community.oneroom', version_name: '3.0.03.0529.03', version_code: 50020044, os: 'android', os_version: '12', install_ch: 'ps', device_id: randomBytes(16).toString('hex'), install_store: 'ps', gaid: crypto.randomUUID(), brand: 'Redmi', model: '2201117TG', system_language: 'en', net: 'NETWORK_WIFI', region: 'US', timezone: 'Europe/London', sp_code: '40401', 'X-Play-Mode': '2' });
+let mbToken = '';
+let mbBooted = false;
+
+function mbMd5(data) { return crypto.createHash('md5').update(data).digest('hex'); }
+
+function mbSortedQuery(url) {
+    const u = new URL(url);
+    const map = {};
+    for (const [k, v] of u.searchParams) { (map[k] = map[k] || []).push(v); }
+    return Object.keys(map).sort().map(k => map[k].map(v => `${k}=${v}`).join('&')).join('&');
+}
+
+function mbHeaders(method, url, bodyStr, contentType) {
+    const ts = Date.now();
+    const accept = 'application/json';
+    let bodyHash = '', bodyLen = '';
+    if (bodyStr != null) {
+        const buf = Buffer.from(bodyStr, 'utf-8');
+        bodyHash = mbMd5(buf.subarray(0, 102400));
+        bodyLen = String(buf.length);
+    }
+    const u = new URL(url);
+    const q = mbSortedQuery(url);
+    const canonicalUrl = q ? `${u.pathname}?${q}` : u.pathname;
+    const canonical = [method.toUpperCase(), accept, contentType || '', bodyLen, String(ts), bodyHash, canonicalUrl].join('\n');
+    const key = Buffer.from(MB_SECRET_DEFAULT + '='.repeat((4 - MB_SECRET_DEFAULT.length % 4) % 4), 'base64');
+    const sig = crypto.createHmac('md5', key).update(canonical, 'utf-8').digest('base64');
+    const reversed = String(ts).split('').reverse().join('');
+    const headers = {
+        'User-Agent': MB_UA,
+        'Accept': accept,
+        'Content-Type': contentType,
+        'Connection': 'keep-alive',
+        'X-Client-Token': `${ts},${mbMd5(reversed)}`,
+        'x-tr-signature': `${ts}|2|${sig}`,
+        'X-Client-Info': MB_CLIENT_INFO,
+        'X-Client-Status': '0'
+    };
+    if (mbToken) headers['Authorization'] = `Bearer ${mbToken}`;
+    return headers;
+}
+
+async function mbRequest(method, pathAndQuery, bodyStr) {
+    let lastErr = null;
+    for (const base of MB_HOSTS) {
+        const url = base + pathAndQuery;
+        try {
+            const res = await axios({
+                method, url,
+                headers: mbHeaders(method, url, bodyStr, method === 'POST' ? 'application/json; charset=utf-8' : 'application/json'),
+                data: bodyStr || undefined,
+                timeout: 20000,
+                validateStatus: () => true
+            });
+            const xu = res.headers && res.headers['x-user'];
+            if (xu) { try { const p = typeof xu === 'string' ? JSON.parse(xu) : xu; if (p && p.token) mbToken = p.token; } catch (_) {} }
+            if (MB_RETRY.has(res.status)) { lastErr = new Error('MovieBox HTTP ' + res.status); continue; }
+            const json = res.data;
+            if (!json || typeof json !== 'object') throw new Error('رد غير متوقع من MovieBox (HTTP ' + res.status + ')');
+            if (json.code === 0 && json.message === 'ok') return json.data;
+            throw new Error(`MovieBox: ${json.message || 'خطأ'} (code ${json.code})`);
+        } catch (e) {
+            if (e && e.message && (e.message.startsWith('MovieBox:') || e.message.startsWith('رد غير متوقع'))) throw e;
+            lastErr = e;
+        }
+    }
+    throw lastErr || new Error('تعذّر الاتصال بـ MovieBox');
+}
+
+async function mbBootstrap() {
+    try { await mbRequest('GET', '/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version='); } catch (_) {}
+}
+
+async function mbCall(method, pathAndQuery, bodyStr) {
+    if (!mbBooted) { mbBooted = true; await mbBootstrap(); }
+    try {
+        return await mbRequest(method, pathAndQuery, bodyStr);
+    } catch (e) {
+        if (String(e.message).includes('miss token') || String(e.message).includes('441')) {
+            mbToken = '';
+            await mbBootstrap();
+            return await mbRequest(method, pathAndQuery, bodyStr);
+        }
+        throw e;
+    }
+}
+
+function mbQS(params) {
+    return Object.entries(params).filter(([, v]) => v !== undefined && v !== null)
+        .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join('&');
+}
+
+// بحث MovieBox: subjectType 1=فيلم، 2=مسلسل — النتائج من أول مجموعة مواضيع
+async function movieboxSearch(query, kind) {
+    const want = kind === 'movie' ? 1 : 2;
+    const body = JSON.stringify({ keyword: query, page: 1, perPage: 20, subjectType: want, tabId: 'All' });
+    const data = await mbCall('POST', '/wefeed-mobile-bff/subject-api/search/v2', body);
+    const items = (data && data.results && data.results[0] && data.results[0].subjects) || [];
+    const out = [];
+    for (const it of items) {
+        if (!it || !it.subjectId || !it.title) continue;
+        if (it.subjectType && it.subjectType !== want) continue;
+        out.push({ id: String(it.subjectId), title: String(it.title), type: kind });
+        if (out.length >= 8) break;
+    }
+    return out;
+}
+
+// حلقات MovieBox: من season-info — كل موسم وحلقاته 1..maxEp، والمعرّف يحمل الموسم والحلقة
+async function movieboxEpisodes(subjectId) {
+    const data = await mbCall('GET', '/wefeed-mobile-bff/subject-api/season-info?' + mbQS({ subjectId }));
+    const seasons = ((data && data.seasons) || []).slice().sort((a, b) => a.se - b.se);
+    const eps = [];
+    let n = 0;
+    for (const s of seasons) {
+        const maxEp = parseInt(s.maxEp) || 0;
+        for (let e = 1; e <= maxEp; e++) {
+            n++;
+            eps.push({ id: `${subjectId}|${s.se}|${e}`, number: n, title: seasons.length > 1 ? `الحلقة ${e} (موسم ${s.se})` : `الحلقة ${e}` });
+        }
+    }
+    return eps;
+}
+
+// أول ترجمة عربية متاحة بين أول 5 موارد (الترجمات مرتبطة بالمورد نفسه)
+async function movieboxArabicSub(subjectId, resources) {
+    for (const r of resources.slice(0, 5)) {
+        if (!r.resourceId) continue;
+        try {
+            const data = await mbCall('GET', '/wefeed-mobile-bff/subject-api/get-ext-captions?' + mbQS({ subjectId, resourceId: r.resourceId }));
+            const caps = (data && data.extCaptions) || [];
+            const ar = caps.find(c => c.lan === 'ar' || /arab|عرب/i.test(String(c.lanName || '')));
+            if (ar && ar.url) return ar.url;
+        } catch (_) {}
+    }
+    return null;
+}
+
+// روابط MovieBox: من قائمة الموارد — ملفات MP4 مباشرة، الأفضل (الأكبر حجماً) لكل جودة، المجانية أولاً
+async function movieboxLinks(subjectId, se, ep) {
+    const data = await mbCall('GET', '/wefeed-mobile-bff/subject-api/resource?' + mbQS({ subjectId, se, ep, resolution: 0, page: 1, perPage: 20 }));
+    let list = ((data && data.list) || []).filter(r => r && r.resourceLink);
+    if (!list.length) return { links: [] };
+    const free = list.filter(r => !r.requireMemberType);
+    if (free.length) list = free;
+    const byRes = new Map();
+    for (const r of list) {
+        const res = parseInt(r.resolution) || 0;
+        const prev = byRes.get(res);
+        if (!prev || (parseInt(r.size) || 0) > (parseInt(prev.size) || 0)) byRes.set(res, r);
+    }
+    const picked = [...byRes.values()].sort((a, b) => (parseInt(b.resolution) || 0) - (parseInt(a.resolution) || 0));
+    const links = picked.map(r => ({ url: r.resourceLink, label: `MovieBox — ${r.resolution || '?'}p` }));
+    const probeOrder = list.slice().sort((a, b) => (parseInt(b.resolution) || 0) - (parseInt(a.resolution) || 0));
+    const subtitleUrl = await movieboxArabicSub(subjectId, probeOrder);
+    return { links, subtitleUrl };
+}
 
 // ---------- FarfeshPlus (farfeshplus): مسلسلات عربية ومدبلجة — بحث + حلقات + بث HLS ----------
 // البحث عبر نقطة اقتراحات الموقع الرسمية (POST keyword) التي تُرجع روابط SeriesV،
@@ -6439,6 +6609,7 @@ async function mvSearchOne(name, query, kind) {
         if (kind !== 'series') return []; // Al-Mastaba في .series فقط
         return await almstbaSearch(query);
     }
+    if (e.source === 'moviebox') return await movieboxSearch(query, kind);
     return [];
 }
 
@@ -8828,6 +8999,8 @@ async function startXeonBotInc() {
                                     await showEpisodes(await farfeshEpisodes(selected.id));
                                 } else if (selected.source === 'almstba') {
                                     await showEpisodes(await almstbaEpisodes(selected.id));
+                                } else if (selected.source === 'moviebox') {
+                                    await showEpisodes(await movieboxEpisodes(selected.id));
                                 } else {
                                     throw new Error('مصدر غير معروف.');
                                 }
@@ -12350,7 +12523,7 @@ async function lodynetEpisodeLinks(episodeUrl) {
                             await XeonBotInc.sendMessage(chatId, {
                                 text: locked
                                     ? `🔍 جاري البحث عن *${query}* في مصدر ${locked.label} فقط...`
-                                    : `🔍 جاري البحث عن *${query}* في ${kind === 'series' ? 10 : 7} مصادر...`
+                                    : `🔍 جاري البحث عن *${query}* في ${kind === 'series' ? 11 : 8} مصادر...`
                             }, { quoted: mek });
 
                             const results = [];
@@ -12369,7 +12542,7 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                 addResults(locked.source, locked.cdSource, list, 10);
                             } else {
                                 // بحث متوازي في المصادر — فشل مصدر لا يوقف الباقي
-                                const [akwam, cdCloud, meow, cplus, viola, egyw, okru, myseed, farfesh, almstba] = await Promise.allSettled([
+                                const [akwam, cdCloud, meow, cplus, viola, egyw, okru, myseed, farfesh, almstba, moviebox] = await Promise.allSettled([
                                     akwamSearch(query, kind),
                                     kind === 'series' ? cloudDaySearch(query, 'CimaCloud', '2') : Promise.resolve([]),
                                     meowSearch(query, kind),
@@ -12379,7 +12552,8 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                     kind === 'series' ? okruSearchRaw(query) : Promise.resolve([]),
                                     myseedSearch(query, kind),
                                     kind === 'series' ? farfeshSearch(query) : Promise.resolve([]),
-                                    kind === 'series' ? almstbaSearch(query) : Promise.resolve([])
+                                    kind === 'series' ? almstbaSearch(query) : Promise.resolve([]),
+                                    movieboxSearch(query, kind)
                                 ]);
                                 if (akwam.status === 'fulfilled') addResults('akwam', null, akwam.value, 3);
                                 if (cdCloud.status === 'fulfilled') addResults('cloudday', 'CimaCloud', cdCloud.value, 3);
@@ -12391,10 +12565,11 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                 if (myseed.status === 'fulfilled') addResults('myseed', null, myseed.value, 2);
                                 if (farfesh.status === 'fulfilled') addResults('farfesh', null, farfesh.value, 3);
                                 if (almstba.status === 'fulfilled') addResults('almstba', null, almstba.value, 3);
+                                if (moviebox.status === 'fulfilled') addResults('moviebox', null, moviebox.value, 3);
                             }
-                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setmv <مصدر آخر>\`.` : `لم يتم العثور على أي نتائج في المصادر ${kind === 'series' ? 'العشرة' : 'السبعة'}. جرّب اسماً مختلفاً.`);
+                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setmv <مصدر آخر>\`.` : `لم يتم العثور على أي نتائج في المصادر ${kind === 'series' ? 'الأحد عشر' : 'الثمانية'}. جرّب اسماً مختلفاً.`);
 
-                            const tagOf = s => s === 'akwam' ? '📺 Akwam' : s === 'cloudday' ? '☁️ CloudDay' : s === 'meowtv' ? '🐱 MeowTv' : s === 'cinemaplus' ? '🎬 CinemaPlus' : s === 'viola' ? '🎭 VioLa' : s === 'egywatch' ? '📺 Egywatch' : s === 'myseed' ? '🌱 MySeed' : s === 'farfesh' ? '🍿 Farfesh' : s === 'almstba' ? '📺 Al-Mastaba' : '📺 ok.ru';
+                            const tagOf = s => s === 'akwam' ? '📺 Akwam' : s === 'cloudday' ? '☁️ CloudDay' : s === 'meowtv' ? '🐱 MeowTv' : s === 'cinemaplus' ? '🎬 CinemaPlus' : s === 'viola' ? '🎭 VioLa' : s === 'egywatch' ? '📺 Egywatch' : s === 'myseed' ? '🌱 MySeed' : s === 'farfesh' ? '🍿 Farfesh' : s === 'almstba' ? '📺 Al-Mastaba' : s === 'moviebox' ? '🎬 MovieBox' : '📺 ok.ru';
                             let responseText = kind === 'movie' ? `🎬 *نتائج البحث (أفلام):*\n\n` : `📺 *نتائج البحث (مسلسلات):*\n\n`;
                             results.slice(0, 15).forEach((r, index) => {
                                 responseText += `*${index + 1}* - ${r.title} [${tagOf(r.source)}]\n`;
@@ -12430,7 +12605,8 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                 { name: '📺 ok.ru', fn: async () => { const r = await okruSearchRaw('star trek enterprise'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
                                 { name: '🌱 MySeed', fn: async () => { const r = await myseedSearch('john wick', 'movie'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
                                 { name: '🍿 Farfesh', fn: async () => { const r = await farfeshSearch('حب اسود'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
-                                { name: '📺 Al-Mastaba', fn: async () => { const r = await almstbaSearch('طائر الصباح'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
+                                { name: '📺 Al-Mastaba', fn: async () => { const r = await almstbaSearch('طائر الصباح'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '🎬 MovieBox', fn: async () => { const r = await movieboxSearch('avatar', 'movie'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
                             ];
                             const settled = await Promise.allSettled(probes.map(async p => {
                                 const t = Date.now();
