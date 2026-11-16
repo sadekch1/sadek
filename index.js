@@ -1199,6 +1199,79 @@ async function footballHeadSize(url) {
     } catch (_) { return null; }
 }
 
+// ── تقدير حجم روابط الجودة قبل التحميل (قوائم MV): دقيق للملفات المباشرة عبر HEAD،
+// وتقريبي للبث HLS عبر ضرب متوسط حجم مقاطع عيّنة في مدة الحلقة الكاملة ──
+const MV_SIZE_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+async function mvHeadSize(url, referer) {
+    try {
+        const headers = { 'User-Agent': MV_SIZE_UA, Range: 'bytes=0-0' };
+        if (referer) headers['Referer'] = referer;
+        const res = await axios.head(url, {
+            headers, timeout: 10000, maxRedirects: 5,
+            validateStatus: s => s >= 200 && s < 500
+        });
+        const cr = res.headers['content-range'] || '';
+        const crM = cr.match(/\/(\d+)\s*$/);
+        if (crM) return parseInt(crM[1], 10);
+        const len = parseInt(res.headers['content-length'] || '0', 10);
+        return len > 0 ? len : null;
+    } catch (_) { return null; }
+}
+
+async function mvEstimateHlsSize(playlistUrl, referer) {
+    const headers = { 'User-Agent': MV_SIZE_UA };
+    if (referer) headers['Referer'] = referer;
+    let plRes = await axios.get(playlistUrl, { headers, timeout: 15000, responseType: 'text' });
+    let text = String(plRes.data || '');
+    let base = playlistUrl;
+    if (text.includes('#EXT-X-STREAM-INF')) {
+        const vLine = text.split('\n').map(s => s.trim()).find(s => s && !s.startsWith('#'));
+        if (!vLine) return null;
+        base = new URL(vLine, playlistUrl).href;
+        plRes = await axios.get(base, { headers, timeout: 15000, responseType: 'text' });
+        text = String(plRes.data || '');
+    }
+    const lines = text.split('\n').map(s => s.trim());
+    const segs = [];
+    let totalDur = 0;
+    for (let i = 0; i < lines.length; i++) {
+        const dm = lines[i].match(/^#EXTINF:([\d.]+)/);
+        if (dm) {
+            const dur = parseFloat(dm[1]);
+            totalDur += dur;
+            for (let j = i + 1; j < lines.length; j++) {
+                if (lines[j] && !lines[j].startsWith('#')) { segs.push({ url: new URL(lines[j], base).href, dur }); break; }
+            }
+        }
+    }
+    if (!segs.length || totalDur <= 0) return null;
+    const picks = [...new Set([0, Math.floor(segs.length / 2), segs.length - 1])].map(i => segs[i]);
+    let bytes = 0, durs = 0;
+    for (const p of picks) {
+        const sz = await mvHeadSize(p.url, referer || base);
+        if (sz) { bytes += sz; durs += p.dur; }
+    }
+    if (!bytes || durs <= 0) return null;
+    return Math.round((bytes / durs) * totalDur);
+}
+
+// يضيف الحجم إلى تسمية كل رابط: « — 1.15 GB» للدقيق و« — ~1.15 GB» للمقدّر، بصمت عند الفشل
+async function mvAttachSizes(links) {
+    if (!Array.isArray(links) || !links.length) return;
+    await Promise.allSettled(links.slice(0, 8).map(async (r) => {
+        try {
+            if (/\.m3u8(\?|$)/i.test(r.url)) {
+                const est = await mvEstimateHlsSize(r.url, r.referer || '');
+                if (est && est > 0) r.label += ` — ~${fmtBytes(est)}`;
+            } else {
+                const exact = await mvHeadSize(r.url, r.referer || '');
+                if (exact && exact > 0) r.label += ` — ${fmtBytes(exact)}`;
+            }
+        } catch (_) {}
+    }));
+}
+
 // ── ok.ru: ابحث عن رفع كامل للمباراة (≥ 60 دقيقة) + أطول ملخص كبديل ──
 // يرجّع { full: {id,title,durationSec,qualities:[{name,label,url,sizeBytes}]} | null,
 //         highlights: {id,title,durationSec} | null }
@@ -9083,6 +9156,7 @@ async function startXeonBotInc() {
                                 const direct = async () => {
                                     const resolved = await resolveMvMovieLinks(selected.source, selected.cdSource, selected.id);
                                     if (!resolved.links.length) throw new Error('لا توجد روابط تحميل متاحة.');
+                                    await mvAttachSizes(resolved.links);
                                     let qText = `🍿 *اختر جودة التحميل:*\n🎬 ${selected.title}\n\n`;
                                     resolved.links.forEach((r, i) => { qText += `*${i + 1}* - ${r.label}\n`; });
                                     qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة.`;
@@ -9234,6 +9308,7 @@ async function startXeonBotInc() {
                             try {
                                 const resolved = await resolveMvEpisodeLinks(cachedData.source, cachedData.cdSource, cachedData.mvId, ep);
                                 if (!resolved.links.length) throw new Error('لا توجد روابط تحميل متاحة لهذه الحلقة.');
+                                await mvAttachSizes(resolved.links);
                                 let qText = `🍿 *اختر جودة التحميل:*\n🎬 ${cachedData.title} — الحلقة ${ep.number}\n\n`;
                                 resolved.links.forEach((r, i) => { qText += `*${i + 1}* - ${r.label}\n`; });
                                 qText += `\n💡 رد (Reply) على هذه الرسالة برقم الجودة.`;
