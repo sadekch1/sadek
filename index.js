@@ -5573,7 +5573,7 @@ const mvCache = new Map();
 
 // ── تثبيت مصدر واحد لـ .movie / .series (عبر .setmv) ──
 let mvLockedSource = null; // null = البحث في كل المصادر
-const MV_SOURCE_LIST = ['akwam', 'cimacloud', 'meowtv', 'cinemaplus', 'viola', 'egywatch', 'okru', 'myseed', 'farfesh', 'almstba', 'moviebox'];
+const MV_SOURCE_LIST = ['akwam', 'cimacloud', 'meowtv', 'cinemaplus', 'viola', 'egywatch', 'okru', 'myseed', 'farfesh', 'almstba', 'moviebox', 'qissa'];
 const MV_SOURCE_NAMES = {
     akwam: { source: 'akwam', label: '📺 Akwam' },
     cimacloud: { source: 'cloudday', cdSource: 'CimaCloud', label: '☁️ CloudDay (CimaCloud)' },
@@ -5586,7 +5586,8 @@ const MV_SOURCE_NAMES = {
     myseed: { source: 'myseed', label: '🌱 MySeed' },
     farfesh: { source: 'farfesh', label: '🍿 Farfesh' },
     almstba: { source: 'almstba', label: '📺 Al-Mastaba' },
-    moviebox: { source: 'moviebox', label: '🎬 MovieBox' }
+    moviebox: { source: 'moviebox', label: '🎬 MovieBox' },
+    qissa: { source: 'qissa', label: '📺 Qissa Ishq' }
 };
 
 // ---------- akwam: أفلام ومسلسلات ----------
@@ -6049,7 +6050,7 @@ async function violaEpisodeLinks(vid) {
 // ---------- حل روابط حلقة/فيلم من أي مصدر (أفلام ومسلسلات) ----------
 // ترجع {links: [{url, label, referer?}], subtitleUrl?: string}
 // ---------- Egywatch (gateway.egywatch.live — API بلا auth، مفتاح ثابت) ----------
-// بحث ← عرض المسلسل (المواسم) ← حلقات الموسم ← فيديوهات (Uqload شغال، Server Egy ميت)
+// بحث ← عرض المسلسل (المواسم) ← حلقات الموسم ← فيديوهات (Uqload، ثم Server Turki المباشر عبر badmoussi، ثم أي مشغّل مضمّن)
 // ملحوظة: بلا ترجمة عربية في الستريم نفسه (الـ API يقول lang Arabic بلا ملف ترجمة فعلي)
 const EGYWATCH_BASES = ['https://gateway.egywatch.live/egywatchapp/public/api', 'https://rn62mwg.com/egywatchapp/public/api'];
 const EGYWATCH_CODE = 'p2lbgWkFrykA4QyUmpHihzmc5BNzIABq';
@@ -6100,6 +6101,37 @@ async function egywatchEpisodes(seriesId) {
     return eps;
 }
 
+// روابط «Server Turki» (badmoussi): واجهة ترجع قائمة سيرفرات، بعضها برابط HLS مباشر (data JSON داخل JSON)
+async function egywatchBadmoussiLinks(apiUrl) {
+    const res = await axios.get(apiUrl, { headers: { 'User-Agent': EGYWATCH_UA }, timeout: 20000 });
+    const items = (res.data && res.data.data) || [];
+    for (const item of items) {
+        let inner = null;
+        try { inner = JSON.parse(item.data || '{}'); } catch (_) {}
+        const url = inner && inner.url;
+        if (!url || !/\.m3u8(\?|$)/i.test(url)) continue;
+        const plRes = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 20000, responseType: 'text' });
+        const variants = parseM3u8Variants(String(plRes.data || ''), url);
+        if (variants.length) return variants.map(v => ({ url: v.url, label: `Egywatch — ${v.label} (Server Turki)`, referer: '' }));
+        return [{ url, label: 'Egywatch — HLS (Server Turki)', referer: '' }];
+    }
+    return [];
+}
+
+// استخراج عام لأي مشغّل مضمّن: m3u8 في HTML الصفحة أو داخل سكربت مضغوط (miravd/mwdy/vidspeed...)
+async function egywatchGenericEmbedLinks(embedUrl, referer) {
+    const html = await fetchText(embedUrl, { headers: { Referer: referer || embedUrl } });
+    const unpacked = deanEdwardsUnpack(html);
+    const src = unpacked || html;
+    const m = src.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i);
+    if (!m) throw new Error('لم يتم العثور على رابط m3u8 في صفحة المشغّل.');
+    const master = m[0].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+    const plRes = await axios.get(master, { headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': embedUrl }, timeout: 20000, responseType: 'text' });
+    const variants = parseM3u8Variants(String(plRes.data || ''), master);
+    if (variants.length) return variants.map(v => ({ url: v.url, label: `Egywatch — ${v.label}`, referer: embedUrl }));
+    return [{ url: master, label: 'Egywatch — HLS', referer: embedUrl }];
+}
+
 async function egywatchEpisodeLinks(ep) {
     const videos = ep.videos || [];
     const tryUq = async (url) => {
@@ -6123,12 +6155,27 @@ async function egywatchEpisodeLinks(ep) {
     if (uq) {
         try { return await tryUq(uq.url || uq.link); } catch (_) {}
     }
+    // Server Turki: روابط HLS مباشرة عبر واجهة badmoussi
+    const bm = videos.find(v => /badmoussi\.com/i.test(v.url || v.link || ''));
+    if (bm) {
+        try {
+            const links = await egywatchBadmoussiLinks(bm.url || bm.link);
+            if (links.length) return links;
+        } catch (_) {}
+    }
     for (const v of videos) {
         const url = v.url || v.link || '';
         if (/\.mp4(\?|$)/i.test(url)) return [{ url, label: `Egywatch — MP4 (${v.server || 'server'})`, referer: '' }];
         if (/uqload/i.test(url)) {
             try { return await tryUq(url); } catch (_) {}
         }
+    }
+    // محاولة أخيرة: أي مشغّل مضمّن آخر في القائمة (عدا روابط Google التي تحتاج ترويسات خاصة)
+    for (const v of videos) {
+        const url = v.url || v.link || '';
+        if (!/^https?:\/\//i.test(url) || /badmoussi|googlefas/i.test(url)) continue;
+        const refM = String(v.header || '').match(/^https?:\/\/[^\s|]+/);
+        try { return await egywatchGenericEmbedLinks(url, refM ? refM[0] : undefined); } catch (_) {}
     }
     throw new Error('لا توجد سيرفرات شغالة لهذه الحلقة.');
 }
@@ -6168,6 +6215,7 @@ async function resolveMvEpisodeLinks(source, cdSource, id, ep) {
     if (source === 'farfesh') return { links: await farfeshEpisodeLinks(ep) };
     if (source === 'almstba') return { links: await almstbaEpisodeLinks(ep) };
     if (source === 'moviebox') { const [mbSid, mbSe, mbEp] = String(ep.id).split('|'); return await movieboxLinks(mbSid, parseInt(mbSe) || 1, parseInt(mbEp) || 1); }
+    if (source === 'qissa') return { links: await qissaEpisodeLinks(ep) };
     return { links: [] };
 }
 
@@ -6355,6 +6403,109 @@ async function movieboxLinks(subjectId, se, ep) {
     const probeOrder = list.slice().sort((a, b) => (parseInt(b.resolution) || 0) - (parseInt(a.resolution) || 0));
     const subtitleUrl = await movieboxArabicSub(subjectId, probeOrder);
     return { links, subtitleUrl };
+}
+
+// ---------- Qissa Ishq (3seq): مسلسلات تركية مترجمة ومدبلجة — بحث + حلقات + HLS ----------
+// البحث عبر /search/<q>/ (بطاقات /video/series/)، الحلقات من صفحة المسلسل، والمشغّل من صفحة
+// الحلقة ?do=watch — سيرفرات القالب تُجلب عبر ajax/iframe2.php، وأغلبها vidsp برابط m3u8
+// مباشر داخل صفحة التضمين (يتطلب User-Agent متصفح كاملاً وإلا 403 من الـ CDN).
+const QISSA_BASE = 'https://u.3seq.cam';
+const QISSA_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+async function qissaFetch(url, referer) {
+    const headers = { 'User-Agent': QISSA_UA };
+    if (referer) headers['Referer'] = referer;
+    const res = await axios.get(url, { headers, timeout: 25000, responseType: 'text' });
+    return String(res.data || '');
+}
+
+function qissaTitleFromSlug(url) {
+    const seg = decodeURIComponent(url.replace(/\/$/, '').split('/').pop() || '');
+    return seg.replace(/^مسلسل-/, '').replace(/-[a-z0-9]{4}$/i, '').replace(/-/g, ' ').trim();
+}
+
+// بحث قصة عشق: بطاقات المسلسلات فقط، مع ترشيح خفيف بكلمات الاستعلام (يستبعد روابط النوافذ الجانبية)
+async function qissaSearch(query) {
+    const html = await qissaFetch(`${QISSA_BASE}/search/${encodeURIComponent(query)}/`);
+    const words = String(query).split(/\s+/).map(w => w.trim()).filter(w => w.length >= 3);
+    const seen = new Set();
+    const out = [];
+    const regex = /href="(https:\/\/u\.3seq\.cam\/video\/series\/[^"]+)"/gi;
+    let m;
+    while ((m = regex.exec(html)) !== null) {
+        const url = m[1];
+        if (seen.has(url)) continue;
+        seen.add(url);
+        const title = qissaTitleFromSlug(url);
+        if (!title) continue;
+        if (words.length && !words.some(w => title.includes(w))) continue;
+        out.push({ id: url, title, type: 'series' });
+        if (out.length >= 8) break;
+    }
+    return out;
+}
+
+// حلقات قصة عشق: روابط الحلقات من صفحة المسلسل نفسه (episode-NN في الرابط)
+async function qissaEpisodes(seriesUrl) {
+    const html = await qissaFetch(seriesUrl);
+    const byNum = new Map();
+    const regex = /href="(https:\/\/u\.3seq\.cam\/video\/[^"]*?-episode-(\d+)-(?:a-)?[a-z0-9]+\/)"/gi;
+    let m;
+    while ((m = regex.exec(html)) !== null) {
+        const n = parseInt(m[2]);
+        if (!byNum.has(n)) byNum.set(n, m[1]);
+    }
+    return [...byNum.entries()].sort((a, b) => a[0] - b[0])
+        .map(([n, url], i) => ({ id: url, number: i + 1, title: `الحلقة ${n}` }));
+}
+
+// حلّ صفحة تضمين (vidsp وأمثاله): رابط m3u8 مباشر في HTML الصفحة أو داخل سكربت مضغوط
+async function qissaEmbedLinks(embedUrl) {
+    const html = await qissaFetch(embedUrl, QISSA_BASE + '/');
+    const src = deanEdwardsUnpack(html) || html;
+    const m = src.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/i);
+    if (!m) return [];
+    const master = m[0].replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+    const plRes = await axios.get(master, { headers: { 'User-Agent': QISSA_UA }, timeout: 20000, responseType: 'text' });
+    const variants = parseM3u8Variants(String(plRes.data || ''), master);
+    if (variants.length) return variants.map(v => ({ url: v.url, label: `Qissa Ishq — ${v.label}`, referer: embedUrl }));
+    return [{ url: master, label: 'Qissa Ishq — HLS', referer: embedUrl }];
+}
+
+// روابط حلقة قصة عشق: iframe الجاهز في صفحة المشاهدة + بقية السيرفرات عبر AJAX القالب
+async function qissaEpisodeLinks(ep) {
+    const watchUrl = ep.id + '?do=watch';
+    const html = await qissaFetch(watchUrl);
+    const embeds = [];
+    const seen = new Set();
+    const push = u => { if (u && !seen.has(u)) { seen.add(u); embeds.push(u); } };
+    const im = html.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
+    if (im) push(im[1]);
+    const postM = html.match(/vo_postID\s*=\s*"?(\d+)"?/);
+    if (postM) {
+        const themeM = html.match(/themeDir\s*=\s*"(https?:\/\/[^"]+)"/);
+        const theme = themeM ? themeM[1] : `${QISSA_BASE}/wp-content/themes/vo2025`;
+        const calls = [];
+        let lm;
+        const re2 = /getServer2\(this\.id,(\d+),(\d+)\)/gi;
+        while ((lm = re2.exec(html)) !== null) calls.push(`iframe2.php?id=${postM[1]}&video=${lm[1]}&serverId=${lm[2]}`);
+        const re1 = /getServer\(this\.id,(\d+)\)/gi;
+        while ((lm = re1.exec(html)) !== null) calls.push(`iframe.php?id=${postM[1]}&video=${lm[1]}`);
+        for (const c of calls) {
+            try {
+                const r = await qissaFetch(`${theme}/temp/ajax/${c}`, watchUrl);
+                const f = r.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i);
+                if (f) push(f[1]);
+            } catch (_) {}
+        }
+    }
+    for (const embed of embeds) {
+        try {
+            const links = await qissaEmbedLinks(embed);
+            if (links.length) return links;
+        } catch (_) {}
+    }
+    throw new Error('لا توجد سيرفرات شغالة لهذه الحلقة.');
 }
 
 // ---------- FarfeshPlus (farfeshplus): مسلسلات عربية ومدبلجة — بحث + حلقات + بث HLS ----------
@@ -6610,6 +6761,10 @@ async function mvSearchOne(name, query, kind) {
         return await almstbaSearch(query);
     }
     if (e.source === 'moviebox') return await movieboxSearch(query, kind);
+    if (e.source === 'qissa') {
+        if (kind !== 'series') return []; // Qissa Ishq في .series فقط
+        return await qissaSearch(query);
+    }
     return [];
 }
 
@@ -9001,6 +9156,8 @@ async function startXeonBotInc() {
                                     await showEpisodes(await almstbaEpisodes(selected.id));
                                 } else if (selected.source === 'moviebox') {
                                     await showEpisodes(await movieboxEpisodes(selected.id));
+                                } else if (selected.source === 'qissa') {
+                                    await showEpisodes(await qissaEpisodes(selected.id));
                                 } else {
                                     throw new Error('مصدر غير معروف.');
                                 }
@@ -12523,7 +12680,7 @@ async function lodynetEpisodeLinks(episodeUrl) {
                             await XeonBotInc.sendMessage(chatId, {
                                 text: locked
                                     ? `🔍 جاري البحث عن *${query}* في مصدر ${locked.label} فقط...`
-                                    : `🔍 جاري البحث عن *${query}* في ${kind === 'series' ? 11 : 8} مصادر...`
+                                    : `🔍 جاري البحث عن *${query}* في ${kind === 'series' ? 12 : 8} مصادر...`
                             }, { quoted: mek });
 
                             const results = [];
@@ -12542,7 +12699,7 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                 addResults(locked.source, locked.cdSource, list, 10);
                             } else {
                                 // بحث متوازي في المصادر — فشل مصدر لا يوقف الباقي
-                                const [akwam, cdCloud, meow, cplus, viola, egyw, okru, myseed, farfesh, almstba, moviebox] = await Promise.allSettled([
+                                const [akwam, cdCloud, meow, cplus, viola, egyw, okru, myseed, farfesh, almstba, moviebox, qissa] = await Promise.allSettled([
                                     akwamSearch(query, kind),
                                     kind === 'series' ? cloudDaySearch(query, 'CimaCloud', '2') : Promise.resolve([]),
                                     meowSearch(query, kind),
@@ -12553,7 +12710,8 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                     myseedSearch(query, kind),
                                     kind === 'series' ? farfeshSearch(query) : Promise.resolve([]),
                                     kind === 'series' ? almstbaSearch(query) : Promise.resolve([]),
-                                    movieboxSearch(query, kind)
+                                    movieboxSearch(query, kind),
+                                    kind === 'series' ? qissaSearch(query) : Promise.resolve([])
                                 ]);
                                 if (akwam.status === 'fulfilled') addResults('akwam', null, akwam.value, 3);
                                 if (cdCloud.status === 'fulfilled') addResults('cloudday', 'CimaCloud', cdCloud.value, 3);
@@ -12566,10 +12724,11 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                 if (farfesh.status === 'fulfilled') addResults('farfesh', null, farfesh.value, 3);
                                 if (almstba.status === 'fulfilled') addResults('almstba', null, almstba.value, 3);
                                 if (moviebox.status === 'fulfilled') addResults('moviebox', null, moviebox.value, 3);
+                                if (qissa.status === 'fulfilled') addResults('qissa', null, qissa.value, 3);
                             }
-                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setmv <مصدر آخر>\`.` : `لم يتم العثور على أي نتائج في المصادر ${kind === 'series' ? 'الأحد عشر' : 'الثمانية'}. جرّب اسماً مختلفاً.`);
+                            if (results.length === 0) throw new Error(locked ? `لا نتائج في مصدر ${locked.label}. جرّب اسماً مختلفاً أو بدّل المصدر بـ \`.setmv <مصدر آخر>\`.` : `لم يتم العثور على أي نتائج في المصادر ${kind === 'series' ? 'الاثنا عشر' : 'الثمانية'}. جرّب اسماً مختلفاً.`);
 
-                            const tagOf = s => s === 'akwam' ? '📺 Akwam' : s === 'cloudday' ? '☁️ CloudDay' : s === 'meowtv' ? '🐱 MeowTv' : s === 'cinemaplus' ? '🎬 CinemaPlus' : s === 'viola' ? '🎭 VioLa' : s === 'egywatch' ? '📺 Egywatch' : s === 'myseed' ? '🌱 MySeed' : s === 'farfesh' ? '🍿 Farfesh' : s === 'almstba' ? '📺 Al-Mastaba' : s === 'moviebox' ? '🎬 MovieBox' : '📺 ok.ru';
+                            const tagOf = s => s === 'akwam' ? '📺 Akwam' : s === 'cloudday' ? '☁️ CloudDay' : s === 'meowtv' ? '🐱 MeowTv' : s === 'cinemaplus' ? '🎬 CinemaPlus' : s === 'viola' ? '🎭 VioLa' : s === 'egywatch' ? '📺 Egywatch' : s === 'myseed' ? '🌱 MySeed' : s === 'farfesh' ? '🍿 Farfesh' : s === 'almstba' ? '📺 Al-Mastaba' : s === 'moviebox' ? '🎬 MovieBox' : s === 'qissa' ? '📺 Qissa Ishq' : '📺 ok.ru';
                             let responseText = kind === 'movie' ? `🎬 *نتائج البحث (أفلام):*\n\n` : `📺 *نتائج البحث (مسلسلات):*\n\n`;
                             results.slice(0, 15).forEach((r, index) => {
                                 responseText += `*${index + 1}* - ${r.title} [${tagOf(r.source)}]\n`;
@@ -12606,7 +12765,8 @@ async function lodynetEpisodeLinks(episodeUrl) {
                                 { name: '🌱 MySeed', fn: async () => { const r = await myseedSearch('john wick', 'movie'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
                                 { name: '🍿 Farfesh', fn: async () => { const r = await farfeshSearch('حب اسود'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
                                 { name: '📺 Al-Mastaba', fn: async () => { const r = await almstbaSearch('طائر الصباح'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
-                                { name: '🎬 MovieBox', fn: async () => { const r = await movieboxSearch('avatar', 'movie'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
+                                { name: '🎬 MovieBox', fn: async () => { const r = await movieboxSearch('avatar', 'movie'); if (!r.length) throw new Error('لا نتائج'); return r.length; } },
+                                { name: '📺 Qissa Ishq', fn: async () => { const r = await qissaSearch('طائر الصباح'); if (!r.length) throw new Error('لا نتائج'); return r.length; } }
                             ];
                             const settled = await Promise.allSettled(probes.map(async p => {
                                 const t = Date.now();
