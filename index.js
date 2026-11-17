@@ -215,8 +215,6 @@ const activeLiveChannelRecordings = new Map(); // chatId -> { proc, cancelled, s
 const activeTflixRecordings = new Map(); // chatId -> { stopped }
 const tflixWizardCache = new Map(); // sentMsgId -> job (مراحل: channel/quality/duration/segment)
 const tflixLists = new Map(); // chatId -> { events, at }
-const redgifSessions = new Map(); // chatId -> { stopped, sent } خلاصات .redgif الجارية
-const redgifWizardCache = new Map(); // sentMsgId -> { query } انتظار اختيار جودة .redgif
 
 // ── دومين tflix قابل للتبديل بأمر .settflix (يُحفظ في data/ فيبقى بعد إعادة التشغيل) ──
 const TFLIX_CONFIG_PATH = path.join(process.cwd(), 'data', 'tflix_config.json');
@@ -2157,147 +2155,6 @@ async function tflixBeginFlow(XeonBotInc, chatId, mek, job) {
 }
 // ===== 🎬 .tflix — END =====
 
-// ===== 🔞 .redgif — BEGIN =====
-// خلاصة فيديوهات RedGIFs لتطبيق TikGon: بحث بأي عبارة ← سؤال جودة واحد (HD/SD) ← ضخّ متواصل فيديو بعد فيديو حتى الإيقاف.
-// الـAPI: توكن مؤقت من /v2/auth/temporary (مربوط بعنوان الطالب — على GitHub Actions العنوان ثابت طوال التشغيل فلا مشكلة)،
-// والبحث /v2/gifs/search?search_text=..&page=N يرجّع روابط MP4 مباشرة (hd/sd) + المدة. كل الطلبات عبر Agent واحد مثبّت الاتصال.
-const REDGIF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-const redgifAgent = new https.Agent({ keepAlive: true, maxSockets: 4 });
-let redgifTokenCache = { token: '', at: 0 };
-
-async function redgifGetToken(force) {
-    if (!force && redgifTokenCache.token && Date.now() - redgifTokenCache.at < 25 * 60 * 1000) return redgifTokenCache.token;
-    const res = await axios.get('https://api.redgifs.com/v2/auth/temporary', {
-        headers: { 'User-Agent': REDGIF_UA }, httpsAgent: redgifAgent, timeout: 20000
-    });
-    const token = res.data && res.data.token;
-    if (!token) throw new Error('لم يرجع الموقع توكن دخول');
-    redgifTokenCache = { token, at: Date.now() };
-    return token;
-}
-
-async function redgifSearchPage(query, page) {
-    const doReq = (tk) => axios.get('https://api.redgifs.com/v2/gifs/search', {
-        params: { tags: String(query).split(/[\s,]+/).filter(Boolean).join(','), type: 'g', count: 20, page, order: 'trending' },
-        headers: { 'User-Agent': REDGIF_UA, 'Authorization': 'Bearer ' + tk },
-        httpsAgent: redgifAgent, timeout: 25000
-    });
-    try {
-        const res = await doReq(await redgifGetToken(false));
-        return res.data || {};
-    } catch (e) {
-        if (e.response && e.response.status === 401) {
-            const res = await doReq(await redgifGetToken(true));
-            return res.data || {};
-        }
-        throw e;
-    }
-}
-
-async function redgifDownload(url, outPath) {
-    const res = await axios.get(url, {
-        responseType: 'stream',
-        headers: { 'User-Agent': REDGIF_UA },
-        httpsAgent: redgifAgent, timeout: 180000, maxRedirects: 5
-    });
-    await new Promise((resolve, reject) => {
-        const ws = fs.createWriteStream(outPath);
-        res.data.pipe(ws);
-        res.data.on('error', reject);
-        ws.on('finish', resolve);
-        ws.on('error', reject);
-    });
-}
-
-// بدء خلاصة في محادثة (تستبدل أي خلاصة جارية فيها): تضخّ النتائج صفحة بعد صفحة حتى الإيقاف أو نفاد النتائج
-async function redgifStartPump(XeonBotInc, chatId, mek, query, quality) {
-    const prev = redgifSessions.get(chatId);
-    if (prev) prev.stopped = true;
-    const control = { stopped: false, sent: 0, nextBreakAt: 14 + Math.floor(Math.random() * 10) };
-    redgifSessions.set(chatId, control);
-    const qLabel = quality === 'hd' ? 'HD' : 'SD';
-    await XeonBotInc.sendMessage(chatId, {
-        text: `🎬 *TikGon feed:* ${query} [${qLabel}]\n🔍 بدأت الخلاصة — سأرسل الفيديوهات واحداً تلو الآخر بلا توقف.\n🛑 للإيقاف: \`.stopredgif\``
-    }, { quoted: mek });
-    const tmpDir = path.join(process.cwd(), 'dltmp');
-    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-    let failStreak = 0;
-    try {
-        let page = 1;
-        let totalPages = 1;
-        while (!control.stopped && redgifSessions.get(chatId) === control && page <= totalPages) {
-            let data;
-            try {
-                data = await redgifSearchPage(query, page);
-            } catch (e) {
-                failStreak++;
-                if (failStreak >= 3) throw new Error('فشل جلب نتائج البحث 3 مرات متتالية: ' + e.message);
-                await new Promise(r => setTimeout(r, 3000));
-                continue;
-            }
-            totalPages = data.pages || page;
-            const gifs = data.gifs || [];
-            if (!gifs.length) {
-                if (page === 1 && control.sent === 0) {
-                    await XeonBotInc.sendMessage(chatId, { text: `🔍 *لا توجد نتائج للبحث:* ${query}\nجرّب كلمات أبسط أو كلمة واحدة.` }, { quoted: mek }).catch(() => {});
-                    control.stopped = true;
-                }
-                break;
-            }
-            for (const g of gifs) {
-                if (control.stopped || redgifSessions.get(chatId) !== control) break;
-                const urls = g.urls || {};
-                const fileUrl = quality === 'hd' ? (urls.hd || urls.sd) : (urls.sd || urls.hd);
-                if (!fileUrl) continue;
-                const outPath = path.join(tmpDir, `rg_${randomBytes(5).toString('hex')}.mp4`);
-                try {
-                    await redgifDownload(fileUrl, outPath);
-                    if (control.stopped || redgifSessions.get(chatId) !== control) break;
-                    const sizeMB = (fs.statSync(outPath).size / 1024 / 1024).toFixed(2);
-                    try { await XeonBotInc.sendPresenceUpdate('composing', chatId); } catch (e) {}
-                    await new Promise(r => setTimeout(r, 1500 + Math.floor(Math.random() * 2000)));
-                    await XeonBotInc.sendMessage(chatId, {
-                        document: { url: outPath },
-                        mimetype: 'video/mp4',
-                        fileName: `redgif_${control.sent + 1}.mp4`,
-                        caption: `🎞 *${control.sent + 1}* • ${query}\n${g.duration ? `⏱ ${Math.round(g.duration)} ثانية • ` : ''}${qLabel} • ⚖️ ${sizeMB} MB`
-                    }, { quoted: mek });
-                    try { await XeonBotInc.sendPresenceUpdate('paused', chatId); } catch (e) {}
-                    control.sent++;
-                    failStreak = 0;
-                } catch (e) {
-                    failStreak++;
-                    console.log('[REDGIF] download/send failed:', e && e.message);
-                    if (failStreak >= 5) throw new Error('فشل إرسال 5 فيديوهات متتالية — آخر خطأ: ' + e.message);
-                } finally {
-                    try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
-                }
-                if (control.sent >= (control.nextBreakAt || 20)) {
-                    control.nextBreakAt = control.sent + 14 + Math.floor(Math.random() * 10);
-                    const breakMs = 120000 + Math.floor(Math.random() * 180000); // 2-5 min human break
-                    for (let slept = 0; slept < breakMs && !control.stopped; slept += 5000) await new Promise(r => setTimeout(r, Math.min(5000, breakMs - slept)));
-                } else {
-                    await new Promise(r => setTimeout(r, 9000 + Math.floor(Math.random() * 9000))); // random 9-18s gap
-                }
-            }
-            page++;
-        }
-        if (redgifSessions.get(chatId) === control && !control.stopped) {
-            await XeonBotInc.sendMessage(chatId, {
-                text: `🏁 *انتهت نتائج البحث* عن: ${query}\n📦 مجموع ما أُرسل: ${control.sent} فيديو.`
-            }, { quoted: mek });
-        }
-    } catch (e) {
-        if (redgifSessions.get(chatId) === control) {
-            await XeonBotInc.sendMessage(chatId, {
-                text: `❌ توقّفت خلاصة RedGIFs:\n\`${e.message}\`\n📦 أُرسل قبل التوقف: ${control.sent} فيديو.`
-            }, { quoted: mek });
-        }
-    } finally {
-        if (redgifSessions.get(chatId) === control) redgifSessions.delete(chatId);
-    }
-}
-// ===== 🔞 .redgif — END =====
 
 // ===== 📁 .gofile — BEGIN =====
 // تنزيل من GoFile بدون أي حساب: توكن ضيف مجهول يُنشأ وقت الطلب + توقيع موقع (X-Website-Token).
@@ -8499,21 +8356,6 @@ async function startXeonBotInc() {
                     }
 
                     // ── خطوات .tflix التفاعلية بالرد: قناة ← جودة ← مدة التسجيل ← دقائق الجزء ──
-                    // ── اختيار جودة خلاصة .redgif ──
-                    if (redgifWizardCache.has(quotedId)) {
-                        const cached = redgifWizardCache.get(quotedId);
-                        const pick = String(replyText).trim().toLowerCase();
-                        let quality = null;
-                        if (pick === '1' || pick === 'hd') quality = 'hd';
-                        else if (pick === '2' || pick === 'sd') quality = 'sd';
-                        if (!quality) {
-                            await XeonBotInc.sendMessage(chatId, { text: '❌ رد برقم الجودة: 1 لـ HD أو 2 لـ SD.' }, { quoted: mek });
-                            return;
-                        }
-                        redgifWizardCache.delete(quotedId);
-                        await redgifStartPump(XeonBotInc, chatId, mek, cached.query, quality);
-                        return;
-                    }
                     if (tflixWizardCache.has(quotedId)) {
                         const cached = tflixWizardCache.get(quotedId);
                         const stage = cached.stage || 'quality';
@@ -9577,8 +9419,6 @@ async function startXeonBotInc() {
                     text.startsWith('.tflix') ||
                     text.startsWith('.stoptflix') ||
                     text.startsWith('.settflix') ||
-                    text.startsWith('.redgif') ||
-                    text.startsWith('.stopredgif') ||
                     text.startsWith('.m3u') ||
                     text.startsWith('.record') ||
                     text.startsWith('.stoprecord') ||
@@ -9722,7 +9562,6 @@ async function startXeonBotInc() {
 • \`.livechannel\` — قنوات 24/7 من كل المواقع ذات القنوات (DamiTV، DaddyLive، PPV.ST وغيرها)، بنفس خطوات التسجيل — و \`.stoplivechannel\` للإيقاف — و \`.livechannelapi\` لفحص حالة مصادر القنوات
 • \`.stoplivefootball\` — إيقاف تسجيل مباراة مباشرة
 • \`.tflix\` — مباريات موقع tflix (بث مشفّر ClearKey يفكّه البوت ويسجّله): قائمة/بحث، ثم اختيار برقم وخطوات كالمعتاد (قناة ← جودة ← مدة ← جزء)
-• \`.redgif <بحث>\` — خلاصة فيديوهات RedGIFs (لتطبيق TikGon): أي كلمات بحث، يسألك عن الجودة مرة واحدة (HD/SD) ثم يضخّ الفيديوهات واحداً تلو الآخر بلا توقف — و\`.stopredgif\` للإيقاف
   ↳ \`.tflix <رابط صفحة مباراة tflix>\` للتسجيل من رابط مباشر — و \`.tflix [رقم] link\` لطباعة رابط MPD ومفتاح فك التشفير — و \`.stoptflix\` للإيقاف
   ↳ الدومين قابل للتبديل إن تغيّر عنوان الموقع: \`.tflix -domain <الدومين الجديد>\` (مثال: \`.tflix -domain tflix.su\`) — و \`.tflix -domain\` وحده يعرض الحالي
 
@@ -10534,49 +10373,6 @@ async function startXeonBotInc() {
                         await XeonBotInc.sendMessage(chatId, {
                             text: `🛑 جاري إلغاء تسجيل tflix... سيتم إنهاء الجزء الحالي ثم التوقف.`
                         }, { quoted: mek });
-                        return;
-                    }
-
-                    // ── أمر .stopredgif — إيقاف خلاصة RedGIFs الجارية ──
-                    if (command === '.stopredgif') {
-                        const s = redgifSessions.get(chatId);
-                        if (s) {
-                            s.stopped = true;
-                            redgifSessions.delete(chatId);
-                            await XeonBotInc.sendMessage(chatId, {
-                                text: `🛑 *توقّفت خلاصة RedGIFs.*\n📦 مجموع ما أُرسل: ${s.sent || 0} فيديو.`
-                            }, { quoted: mek });
-                        } else {
-                            await XeonBotInc.sendMessage(chatId, {
-                                text: `ℹ️ لا توجد خلاصة RedGIFs جارية في هذه المحادثة.`
-                            }, { quoted: mek });
-                        }
-                        return;
-                    }
-
-                    // ── أمر .redgif — خلاصة RedGIFs لتطبيق TikGon ──
-                    // .redgif <بحث>        → يسأل عن الجودة مرة واحدة ثم يضخّ الفيديوهات بلا توقف
-                    // .redgif <بحث> hd|sd  → يبدأ فوراً بالجودة المكتوبة في آخر الأمر
-                    if (command === '.redgif') {
-                        let q = query.trim();
-                        if (!q) {
-                            await XeonBotInc.sendMessage(chatId, {
-                                text: `🔞 *خلاصة RedGIFs (TikGon)*\n\nالاستعمال: \`.redgif <كلمات البحث>\`\nمثال: \`.redgif asian ass\`\n\nيسألك البوت عن الجودة مرة واحدة (HD/SD) ثم يرسل الفيديوهات واحداً تلو الآخر بلا توقف.\n⚡ اختصار: أضف hd أو sd في آخر الأمر ليبدأ فوراً بلا سؤال.\n🛑 الإيقاف: \`.stopredgif\``
-                            }, { quoted: mek });
-                            return;
-                        }
-                        let quality = null;
-                        const qm = q.match(/\s+(hd|sd)$/i);
-                        if (qm) { quality = qm[1].toLowerCase(); q = q.slice(0, qm.index).trim(); }
-                        if (quality) {
-                            await redgifStartPump(XeonBotInc, chatId, mek, q, quality);
-                            return;
-                        }
-                        const sentQ = await XeonBotInc.sendMessage(chatId, {
-                            text: `🎞 *اختر جودة الخلاصة:*\n🔍 البحث: *${q}*\n\n*1.* HD — أعلى جودة (ملفات كبيرة: ~32 MB للفيديو)\n*2.* SD — خفيفة وسريعة (~5 MB — الأنسب لخلاصة سلسة بلا انتظار)\n\n💡 رد (Reply) على هذه الرسالة برقم الجودة خلال 5 دقائق — تُطبَّق على كل فيديوهات هذه الخلاصة.`
-                        }, { quoted: mek });
-                        redgifWizardCache.set(sentQ.key.id, { query: q });
-                        setTimeout(() => redgifWizardCache.delete(sentQ.key.id), 300000);
                         return;
                     }
 
