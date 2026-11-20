@@ -216,6 +216,9 @@ const activeTflixRecordings = new Map(); // chatId -> { stopped }
 const tflixWizardCache = new Map(); // sentMsgId -> job (مراحل: channel/quality/duration/segment)
 const tflixLists = new Map(); // chatId -> { events, at }
 
+const redgifSessions = new Map(); // chatId -> { stopped, sent, source, seen } خلاصات TikGon الجارية (سجلّ مشترك لكل المصادر — خلاصة واحدة لكل محادثة)
+const redgifWizardCache = new Map(); // sentMsgId -> { source, query } انتظار اختيار جودة الخلاصة
+
 // ── دومين tflix قابل للتبديل بأمر .settflix (يُحفظ في data/ فيبقى بعد إعادة التشغيل) ──
 const TFLIX_CONFIG_PATH = path.join(process.cwd(), 'data', 'tflix_config.json');
 const TFLIX_CONFIG = { domain: 'tflix.su' };
@@ -1414,6 +1417,7 @@ async function mvEstimateHlsSize(playlistUrl, referer) {
 async function mvAttachSizes(links) {
     if (!Array.isArray(links) || !links.length) return;
     await Promise.allSettled(links.slice(0, 8).map(async (r) => {
+        if (r.sizeDone) return;
         try {
             if (/\.m3u8(\?|$)/i.test(r.url)) {
                 const est = await mvEstimateHlsSize(r.url, r.referer || '');
@@ -2154,6 +2158,423 @@ async function tflixBeginFlow(XeonBotInc, chatId, mek, job) {
     await tflixWizardNext(XeonBotInc, chatId, mek, job);
 }
 // ===== 🎬 .tflix — END =====
+
+
+// ===== 🐦 تحميل X التلقائي (ssstwitter) — BEGIN =====
+// Auto-download for X/Twitter videos: any NON-command message that contains
+// an x.com / twitter.com status link is resolved through ssstwitter.com and
+// the best available quality is downloaded and sent back to the same chat.
+// No command needed. ssstwitter flow (no account, no cookies):
+//   GET  https://ssstwitter.com/        -> parse include-vals (tt + ts pair)
+//   POST https://ssstwitter.com/        -> form fields id/tt/ts/source/locale
+//   parse the result HTML for signed ssscdn.io download links + WxH labels.
+const XAUTO_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const xAutoBusy = new Set();   // chatIds with an auto-download in flight
+const xAutoSeen = new Map();   // chatId|tweetId -> ts (dedupe window)
+const XAUTO_DEDUPE_MS = 10 * 60 * 1000;
+const XAUTO_MAX_BYTES = 2000 * 1024 * 1024; // WhatsApp file cap
+
+function xAutoExtractLink(text) {
+    if (!text) return null;
+    const m = String(text).match(/https?:\/\/(?:www\.|mobile\.)?(?:x\.com|twitter\.com)\/[^\s]+/i);
+    if (!m) return null;
+    const url = m[0].replace(/[)\].,;!?]+$/, '');
+    const idm = url.match(/\/status\/(\d+)/);
+    if (!idm) return null;
+    return { url, id: idm[1] };
+}
+
+function xAutoCanonical(tweetUrl) {
+    const m = String(tweetUrl).match(/(?:x\.com|twitter\.com)\/([^/]+)\/status\/(\d+)/i);
+    if (!m) return tweetUrl;
+    return 'https://x.com/' + m[1] + '/status/' + m[2];
+}
+
+async function xAutoResolveOnce(tweetUrl) {
+    const home = await axios.get('https://ssstwitter.com/', {
+        headers: { 'User-Agent': XAUTO_UA },
+        timeout: 30000
+    });
+    const homeHtml = String(home.data || '');
+    const ttm = homeHtml.match(/tt:'([a-f0-9]{16,})'/i);
+    const tsm = homeHtml.match(/ts:(\d{9,})/);
+    if (!ttm || !tsm) throw new Error('ssstwitter token not found');
+    const cookieHdr = (home.headers && home.headers['set-cookie'])
+        ? home.headers['set-cookie'].map(c => c.split(';')[0]).join('; ')
+        : '';
+    const form = new URLSearchParams();
+    form.set('id', xAutoCanonical(tweetUrl));
+    form.set('tt', ttm[1]);
+    form.set('ts', tsm[1]);
+    form.set('source', 'form');
+    form.set('locale', 'en');
+    // NOTE: the result HTML arrives in the body of a 301 response (htmx
+    // pattern, hx-trigger: ssssuccess). Redirects must NOT be followed —
+    // following the 301 lands back on the homepage with no result.
+    const res = await axios.post('https://ssstwitter.com/', form.toString(), {
+        headers: {
+            'User-Agent': XAUTO_UA,
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'HX-Request': 'true',
+            'Referer': 'https://ssstwitter.com/',
+            ...(cookieHdr ? { 'Cookie': cookieHdr } : {})
+        },
+        timeout: 60000,
+        maxRedirects: 0,
+        validateStatus: () => true
+    });
+    const html = String(res.data || '');
+    const links = [];
+    const seenUrls = new Set();
+    // The best-quality button carries its URL in data-directurl (no href);
+    // the other buttons use href. Check both attributes on every anchor.
+    const anchorRe = /<a\b([^>]*)>([\s\S]*?)<\/a>/g;
+    let mm;
+    while ((mm = anchorRe.exec(html)) !== null) {
+        const attrs = mm[1];
+        const du = attrs.match(/data-directurl="(https:\/\/ssscdn\.io\/[^"]+)"/);
+        const hf = attrs.match(/href="(https:\/\/ssscdn\.io\/[^"]+)"/);
+        const raw = (du && du[1]) || (hf && hf[1]);
+        if (!raw) continue;
+        const u = raw.replace(/&amp;/g, '&');
+        if (seenUrls.has(u)) continue;
+        seenUrls.add(u);
+        const inner = mm[2].replace(/<[^>]+>/g, ' ');
+        const rm = inner.match(/(\d{3,5})\s*x\s*(\d{3,5})/);
+        links.push({ url: u, w: rm ? +rm[1] : 0, h: rm ? +rm[2] : 0, label: rm ? (rm[1] + 'x' + rm[2]) : '', best: /quality-best/.test(attrs) });
+    }
+    if (!links.length) {
+        const bare = html.match(/https:\/\/ssscdn\.io\/[^"'\s]+/g) || [];
+        for (const b of bare) {
+            const u = b.replace(/&amp;/g, '&');
+            if (!seenUrls.has(u)) { seenUrls.add(u); links.push({ url: u, w: 0, h: 0, label: '', best: false }); }
+        }
+    }
+    if (!links.length) return null;
+    links.sort((a, b) => ((b.w * b.h) - (a.w * a.h)) || ((b.best ? 1 : 0) - (a.best ? 1 : 0)));
+    return links[0];
+}
+
+async function xAutoResolve(tweetUrl) {
+    // Their backend is flaky (rotating upstream sessions: some attempts come
+    // back without links). Retry up to 3 times with a fresh token pair.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        const best = await xAutoResolveOnce(tweetUrl);
+        if (best) return best;
+        if (attempt < 3) await new Promise(r => setTimeout(r, 3000 * attempt));
+    }
+    return null;
+}
+
+async function autoXMaybeDownload(sock, chatId, mek, text) {
+    try {
+        if (!chatId || chatId === 'status@broadcast' || chatId.endsWith('@newsletter')) return;
+        const found = xAutoExtractLink(text);
+        if (!found) return;
+        const now = Date.now();
+        const key = chatId + '|' + found.id;
+        if (xAutoSeen.has(key) && now - xAutoSeen.get(key) < XAUTO_DEDUPE_MS) return;
+        if (xAutoBusy.has(chatId)) return;
+        xAutoSeen.set(key, now);
+        if (xAutoSeen.size > 300) {
+            for (const [k, t] of xAutoSeen) if (now - t > XAUTO_DEDUPE_MS) xAutoSeen.delete(k);
+        }
+        xAutoBusy.add(chatId);
+        try {
+            console.log('[xauto] resolving', found.id);
+            const best = await xAutoResolve(found.url);
+            if (!best) {
+                await sock.sendMessage(chatId, { text: '⚠️ تعذّر تحميل فيديو X هذا (قد يكون محذوفاً أو خاصاً).' }, { quoted: mek }).catch(() => {});
+                return;
+            }
+            // Size probe first: over the WhatsApp cap -> print the link instead.
+            let knownSize = 0;
+            try {
+                const head = await axios.head(best.url, { headers: { 'User-Agent': XAUTO_UA, 'Referer': 'https://ssstwitter.com/' }, timeout: 20000 });
+                knownSize = parseInt((head.headers && head.headers['content-length']) || '0', 10) || 0;
+            } catch (_) {}
+            if (knownSize > XAUTO_MAX_BYTES) {
+                await sock.sendMessage(chatId, { text: `⚠️ فيديو X كبير جداً (${fmtBytes(knownSize)}) — يتجاوز حد واتساب 2GB.\nالرابط المباشر في الرسالة التالية:` }, { quoted: mek }).catch(() => {});
+                await sock.sendMessage(chatId, { text: best.url, linkPreview: null }).catch(() => {});
+                return;
+            }
+            const tmpDir = path.join(process.cwd(), 'dltmp');
+            if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+            const outPath = path.join(tmpDir, `x_${found.id}_${randomBytes(3).toString('hex')}.mp4`);
+            try {
+                await downloadVideoSmart(best.url, outPath, { 'User-Agent': XAUTO_UA, 'Referer': 'https://ssstwitter.com/' });
+                const size = fs.statSync(outPath).size;
+                if (!size) throw new Error('empty download');
+                await sock.sendMessage(chatId, {
+                    document: { url: outPath },
+                    mimetype: 'video/mp4',
+                    fileName: `x-${found.id}.mp4`,
+                    caption: `🐦 *فيديو X*${best.label ? `\n⚙️ *الجودة:* ${best.label}` : ''}\n⚖️ *الحجم:* ${fmtBytes(size)}`
+                }, { quoted: mek });
+                console.log('[xauto] sent', found.id, fmtBytes(size));
+            } finally {
+                try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
+            }
+        } finally {
+            xAutoBusy.delete(chatId);
+        }
+    } catch (e) {
+        console.log('[xauto] failed:', e && e.message);
+        try {
+            await sock.sendMessage(chatId, { text: '⚠️ تعذّر تحميل فيديو X هذا.' }, { quoted: mek });
+        } catch (_) {}
+    }
+}
+// ===== 🐦 تحميل X التلقائي (ssstwitter) — END =====
+
+
+// ===== 🔞 خلاصات TikGon (مصادر متعددة) — BEGIN =====
+// محرك ضخّ واحد مشترك بنفس منطق .redgif المُثبت حرفياً (نفس الإيقاع المضاد للحظر، نفس صيغ رسائل TikGon)،
+// وكل مصدر محوّل (adapter) صغير: بحث صفحة ← عناصر {id, url, ...}. المصادر المُثبتة حياً فقط تُشحن:
+// RedGIFs (توكن مؤقت + بحث tags) وErome (بحث HTML + روابط MP4 مباشرة مع Referer).
+// أُسقطت بعد فشل إثباتها: Eporner (بحث يعمل لكن gvideo يرفض 403 وdload خلف تسجيل دخول)،
+// Danbooru (403 Cloudflare من عناوين الخوادم)، Rule34 (الـAPI يطلب مفتاح مصادقة)،
+// Coomer/Kemono (الـAPI يجيب لكن خوادم الملفات data لا تُفتح من الشبكة).
+const REDGIF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const redgifAgent = new https.Agent({ keepAlive: true, maxSockets: 4 });
+let redgifTokenCache = { token: '', at: 0 };
+
+async function redgifGetToken(force) {
+    if (!force && redgifTokenCache.token && Date.now() - redgifTokenCache.at < 25 * 60 * 1000) return redgifTokenCache.token;
+    // ملاحظة مُثبتة بالاختبار (2026-11-19): طلبات الـAPI عبر الـAgent المثبّت تُجهض (200 aborted) في بيئة Node الحديثة،
+    // بينما تعمل بدونه — وعنوان GitHub Actions ثابت طوال التشغيل فيبقى التوكن صالحاً. التنزيل من media ما زال عبر الـAgent (يعمل بالطريقتين).
+    const res = await axios.get('https://api.redgifs.com/v2/auth/temporary', {
+        headers: { 'User-Agent': REDGIF_UA }, timeout: 20000
+    });
+    const token = res.data && res.data.token;
+    if (!token) throw new Error('لم يرجع الموقع توكن دخول');
+    redgifTokenCache = { token, at: Date.now() };
+    return token;
+}
+
+async function redgifSearchPage(query, page) {
+    const doReq = (tk) => axios.get('https://api.redgifs.com/v2/gifs/search', {
+        params: { tags: String(query).split(/[\s,]+/).filter(Boolean).join(','), type: 'g', count: 20, page, order: 'trending' },
+        headers: { 'User-Agent': REDGIF_UA, 'Authorization': 'Bearer ' + tk },
+        timeout: 25000
+    });
+    try {
+        const res = await doReq(await redgifGetToken(false));
+        return res.data || {};
+    } catch (e) {
+        if (e.response && e.response.status === 401) {
+            const res = await doReq(await redgifGetToken(true));
+            return res.data || {};
+        }
+        throw e;
+    }
+}
+
+async function redgifDownload(url, outPath) {
+    const res = await axios.get(url, {
+        responseType: 'stream',
+        headers: { 'User-Agent': REDGIF_UA },
+        httpsAgent: redgifAgent, timeout: 180000, maxRedirects: 5
+    });
+    await new Promise((resolve, reject) => {
+        const ws = fs.createWriteStream(outPath);
+        res.data.pipe(ws);
+        res.data.on('error', reject);
+        ws.on('finish', resolve);
+        ws.on('error', reject);
+    });
+}
+
+// محوّل RedGIFs: يلفّ الدوال المُثبتة أعلاه بصيغة المحرك المشتركة
+async function redgifFeedPage(query, page) {
+    const data = await redgifSearchPage(query, page);
+    const totalPages = data.pages || page;
+    const items = (data.gifs || []).map(g => {
+        const urls = g.urls || {};
+        return { id: 'rg:' + g.id, urlHd: urls.hd || urls.sd, urlSd: urls.sd || urls.hd, duration: g.duration || 0 };
+    }).filter(it => it.urlHd || it.urlSd);
+    return { items, isLast: page >= totalPages };
+}
+
+// ── Erome: بحث HTML (صفحة = ~36 ألبوماً) ← صفحة كل ألبوم تحمل روابط MP4 مباشرة على vNN.erome.com (تتطلب Referer) ──
+async function eromeSearchAlbums(query, page) {
+    const res = await axios.get('https://www.erome.com/search', {
+        params: { q: query, page },
+        headers: { 'User-Agent': REDGIF_UA }, timeout: 25000
+    });
+    const html = String(res.data || '');
+    const ids = [];
+    const seen = new Set();
+    for (const m of html.matchAll(/erome\.com\/a\/([A-Za-z0-9]+)/g)) {
+        if (!seen.has(m[1])) { seen.add(m[1]); ids.push(m[1]); }
+    }
+    return ids;
+}
+
+async function eromeAlbumItems(albumId) {
+    const albumUrl = `https://www.erome.com/a/${albumId}`;
+    const res = await axios.get(albumUrl, {
+        headers: { 'User-Agent': REDGIF_UA, 'Referer': 'https://www.erome.com/search' }, timeout: 25000
+    });
+    const html = String(res.data || '');
+    const titleM = html.match(/<title>([^<]+)<\/title>/);
+    const title = titleM ? titleM[1].replace(/\s*-\s*EroMe\s*$/i, '').trim() : '';
+    const items = [];
+    const seen = new Set();
+    for (const m of html.matchAll(/https?:\/\/[^"'\s]+\.mp4[^"'\s]*/g)) {
+        const url = m[0];
+        const base = url.split('/').pop().replace(/_\d+p(?=\.mp4)/i, '');
+        const key = albumId + ':' + base;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const rendM = url.match(/_(\d+)p\.mp4/i);
+        items.push({ id: 'er:' + key, url, urlHd: url, urlSd: url, duration: 0, title, referer: albumUrl, rend: rendM ? rendM[1] : '' });
+    }
+    return items;
+}
+
+async function eromeFeedPage(query, page) {
+    const albumIds = await eromeSearchAlbums(query, page);
+    const perAlbum = new Array(albumIds.length).fill(null);
+    let idx = 0;
+    const worker = async () => {
+        while (idx < albumIds.length) {
+            const i = idx++;
+            try { perAlbum[i] = await eromeAlbumItems(albumIds[i]); } catch (e) { perAlbum[i] = []; }
+        }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+    const items = [];
+    for (const arr of perAlbum) if (arr) items.push(...arr);
+    return { items, isLast: albumIds.length < 30 };
+}
+
+async function eromeDownload(url, outPath, item) {
+    const res = await axios.get(url, {
+        responseType: 'stream',
+        headers: { 'User-Agent': REDGIF_UA, 'Referer': (item && item.referer) || 'https://www.erome.com/' },
+        timeout: 180000, maxRedirects: 5
+    });
+    await new Promise((resolve, reject) => {
+        const ws = fs.createWriteStream(outPath);
+        res.data.pipe(ws);
+        res.data.on('error', reject);
+        ws.on('finish', resolve);
+        ws.on('error', reject);
+    });
+}
+
+// سجلّ المحوّلات — كل مصدر: اسم العرض، أمره، أمر إيقافه، هل له جودتان، دوال الصفحة والتنزيل وسطر الشرح الإضافي
+const FEED_ADAPTERS = {
+    redgif: {
+        label: 'RedGIFs', cmd: 'redgif', stopCmd: 'stopredgif', hasQuality: true,
+        fetchPage: redgifFeedPage,
+        download: (url, outPath) => redgifDownload(url, outPath),
+        captionExtra: (item, qLabel, sizeMB) => `${item.duration ? `⏱ ${Math.round(item.duration)} ثانية • ` : ''}${qLabel} • ⚖️ ${sizeMB} MB`
+    },
+    erome: {
+        label: 'Erome', cmd: 'erome', stopCmd: 'stoperome', hasQuality: false,
+        fetchPage: eromeFeedPage,
+        download: (url, outPath, item) => eromeDownload(url, outPath, item),
+        captionExtra: (item, qLabel, sizeMB) => `📛 ${item.title || 'Erome'}\nErome${item.rend ? ` • ${item.rend}p` : ''} • ⚖️ ${sizeMB} MB`
+    }
+};
+
+// محرك الضخّ المشترك — نسخة طبق الأصل من منطق redgifStartPump المُثبت (نفس الرسائل والإيقاع وعدّادات الفشل)
+async function feedStartPump(XeonBotInc, chatId, mek, sourceKey, query, quality) {
+    const adapter = FEED_ADAPTERS[sourceKey];
+    if (!adapter) throw new Error('مصدر خلاصة غير معروف: ' + sourceKey);
+    const prev = redgifSessions.get(chatId);
+    if (prev) prev.stopped = true;
+    const control = { stopped: false, sent: 0, source: sourceKey, seen: new Set(), nextBreakAt: 14 + Math.floor(Math.random() * 10) };
+    redgifSessions.set(chatId, control);
+    const qLabel = adapter.hasQuality ? (quality === 'hd' ? 'HD' : 'SD') : 'MP4';
+    await XeonBotInc.sendMessage(chatId, {
+        text: `🎬 *TikGon feed:* ${query} [${qLabel}]\n🔍 بدأت الخلاصة — سأرسل الفيديوهات واحداً تلو الآخر بلا توقف.\n🛑 للإيقاف: \`.${adapter.stopCmd}\``
+    }, { quoted: mek });
+    const tmpDir = path.join(process.cwd(), 'dltmp');
+    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+    let failStreak = 0;
+    try {
+        let page = 1;
+        while (!control.stopped && redgifSessions.get(chatId) === control) {
+            let data;
+            try {
+                data = await adapter.fetchPage(query, page);
+            } catch (e) {
+                failStreak++;
+                if (failStreak >= 3) throw new Error('فشل جلب نتائج البحث 3 مرات متتالية: ' + e.message);
+                await new Promise(r => setTimeout(r, 3000));
+                continue;
+            }
+            const items = data.items || [];
+            if (!items.length) {
+                if (page === 1 && control.sent === 0) {
+                    await XeonBotInc.sendMessage(chatId, { text: `🔍 *لا توجد نتائج للبحث:* ${query}\nجرّب كلمات أبسط أو كلمة واحدة.` }, { quoted: mek }).catch(() => {});
+                    control.stopped = true;
+                }
+                break;
+            }
+            for (const item of items) {
+                if (control.stopped || redgifSessions.get(chatId) !== control) break;
+                if (item.id) { if (control.seen.has(item.id)) continue; control.seen.add(item.id); }
+                const fileUrl = adapter.hasQuality ? (quality === 'hd' ? (item.urlHd || item.urlSd) : (item.urlSd || item.urlHd)) : (item.url || item.urlHd);
+                if (!fileUrl) continue;
+                const outPath = path.join(tmpDir, `feed_${sourceKey}_${randomBytes(5).toString('hex')}.mp4`);
+                try {
+                    await adapter.download(fileUrl, outPath, item);
+                    if (control.stopped || redgifSessions.get(chatId) !== control) break;
+                    const sizeMB = (fs.statSync(outPath).size / 1024 / 1024).toFixed(2);
+                    try { await XeonBotInc.sendPresenceUpdate('composing', chatId); } catch (e) {}
+                    await new Promise(r => setTimeout(r, 1500 + Math.floor(Math.random() * 2000)));
+                    await XeonBotInc.sendMessage(chatId, {
+                        document: { url: outPath },
+                        mimetype: 'video/mp4',
+                        fileName: `${sourceKey}_${control.sent + 1}.mp4`,
+                        caption: `🎞 *${control.sent + 1}* • ${query}\n${adapter.captionExtra(item, qLabel, sizeMB)}`
+                    }, { quoted: mek });
+                    try { await XeonBotInc.sendPresenceUpdate('paused', chatId); } catch (e) {}
+                    control.sent++;
+                    failStreak = 0;
+                } catch (e) {
+                    failStreak++;
+                    console.log(`[FEED:${sourceKey}] download/send failed:`, e && e.message);
+                    if (failStreak >= 5) throw new Error('فشل إرسال 5 فيديوهات متتالية — آخر خطأ: ' + e.message);
+                } finally {
+                    try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
+                }
+                if (control.sent >= (control.nextBreakAt || 20)) {
+                    control.nextBreakAt = control.sent + 14 + Math.floor(Math.random() * 10);
+                    const breakMs = 120000 + Math.floor(Math.random() * 180000); // 2-5 min human break
+                    for (let slept = 0; slept < breakMs && !control.stopped; slept += 5000) await new Promise(r => setTimeout(r, Math.min(5000, breakMs - slept)));
+                } else {
+                    await new Promise(r => setTimeout(r, 9000 + Math.floor(Math.random() * 9000))); // random 9-18s gap
+                }
+            }
+            if (data.isLast) break;
+            page++;
+        }
+        if (redgifSessions.get(chatId) === control && !control.stopped) {
+            await XeonBotInc.sendMessage(chatId, {
+                text: `🏁 *انتهت نتائج البحث* عن: ${query}\n📦 مجموع ما أُرسل: ${control.sent} فيديو.`
+            }, { quoted: mek });
+        }
+    } catch (e) {
+        if (redgifSessions.get(chatId) === control) {
+            await XeonBotInc.sendMessage(chatId, {
+                text: `❌ توقّفت خلاصة ${adapter.label}:\n\`${e.message}\`\n📦 أُرسل قبل التوقف: ${control.sent} فيديو.`
+            }, { quoted: mek });
+        }
+    } finally {
+        if (redgifSessions.get(chatId) === control) redgifSessions.delete(chatId);
+    }
+}
+
+// غلاف توافق: اسم الدالة الأصلي المُثبت يعمل كما هو عبر المحرك المشترك
+async function redgifStartPump(XeonBotInc, chatId, mek, query, quality) {
+    return feedStartPump(XeonBotInc, chatId, mek, 'redgif', query, quality);
+}
+// ===== 🔞 خلاصات TikGon (مصادر متعددة) — END =====
 
 
 // ===== 📁 .gofile — BEGIN =====
@@ -3723,10 +4144,28 @@ async function downloadHlsSegments(url, outPath, headers = {}) {
     }
 }
 
-async function downloadVideoSmart(url, outPath, headers = {}, onProgress = null) {
+async function downloadVideoSmart(url, outPath, headers = {}, onProgress = null, dashMap = null) {
     // onProgress اختياري: { downloaded, total, percent, elapsedMs } — يُستخدم لمسار .football فقط (لوج Actions)
     const notify = (p) => { try { if (typeof onProgress === 'function') onProgress(p); } catch (_) {} };
     const dlStartedAt = Date.now();
+    if (/\.mpd(\?|$)/i.test(String(url || ''))) {
+        notify({ downloaded: 0, total: null, percent: null, elapsedMs: 0 });
+        const hdrsD = Object.entries(headers || {})
+            .filter(([k, v]) => !/^:/.test(k) && v !== undefined && v !== null)
+            .map(([k, v]) => `${k}: ${v}`).join('\r\n');
+        const argsD = [];
+        if (hdrsD) argsD.push('-headers', hdrsD);
+        argsD.push('-i', url);
+        if (dashMap) argsD.push(...String(dashMap).split(' '));
+        argsD.push('-c', 'copy', '-y', outPath);
+        const resD = await runFfmpeg(argsD, null);
+        if (resD.code === 0 && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+            notify({ downloaded: fs.statSync(outPath).size, total: null, percent: 100, elapsedMs: Date.now() - dlStartedAt });
+            return;
+        }
+        try { if (fs.existsSync(outPath)) fs.unlinkSync(outPath); } catch (_) {}
+        throw new Error('فشل تحميل بث DASH عبر ffmpeg');
+    }
     if (isHlsUrl(url)) {
         notify({ downloaded: 0, total: null, percent: null, elapsedMs: 0 });
         // ffmpeg بياخد آخر -headers بس — اجمع كل الهيدرات في وسيط واحد مفصول بـ CRLF
@@ -6326,18 +6765,31 @@ async function resolveMvMovieLinks(source, cdSource, id) {
 
 
 // ---------- MovieBox (moviebox): أفلام ومسلسلات عالمية عبر واجهة تطبيق الأندرويد (aoneroom) ----------
-// بحث + مواسم/حلقات + ملفات MP4 مباشرة من قائمة الموارد (resource) + ترجمة عربية خارجية تُدمج عند التحميل.
-// الواجهة تتطلب توقيعاً (X-Client-Token + x-tr-signature HMAC-MD5 بمفاتيح التطبيق) وتوكن زائر يُحصَد
-// من ترويسة x-user في أول رد — لذا نطلب الصفحة الرئيسية أولاً (البحث المباشر يفشل 441 miss token).
-const MB_HOSTS = ['https://api.inmoviebox.com', 'https://api4sg.aoneroom.com', 'https://api6sg.aoneroom.com', 'https://api6.aoneroom.com', 'https://api5.aoneroom.com', 'https://api4.aoneroom.com', 'https://api3.aoneroom.com'];
+// بروتوكول التطبيق الحالي (نفس وصفة MovieBox-Tui الشغالة): هوية 4.0.01 متماسكة + ترويسة
+// x-client-build (بصمة بناء تُحسب من شهادة التطبيق) + IP مموّه + دخول زائر (visitor-login).
+// الروابط من play-info/v2: بثّ DASH (mpd) حقيقي على hakunaymatata + signCookie يُمرَّر كوكيز
+// للتحميل عبر ffmpeg. أي رابط وهمي (إعلان «حدّث التطبيق» على macdn/other) يُرفض دائماً —
+// الهوية القديمة 3.0.03 صارت محاصرة: الخادم يستبدل كل روابطها بالمقطع الوهمي.
+const MB_HOSTS = ['https://api6.aoneroom.com', 'https://api5.aoneroom.com', 'https://api4.aoneroom.com', 'https://api4sg.aoneroom.com', 'https://api3.aoneroom.com', 'https://api6sg.aoneroom.com', 'https://api.inmoviebox.com'];
 const MB_SECRET_DEFAULT = '76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O';
 const MB_RETRY = new Set([403, 407, 429, 440, 500, 502, 503, 504]);
-const MB_UA = 'com.community.oneroom/50020044 (Linux; U; Android 12; en_US; 2201117TG; Build/S1B.220414.015; Cronet/135.0.7012.3)';
-const MB_CLIENT_INFO = JSON.stringify({ package_name: 'com.community.oneroom', version_name: '3.0.03.0529.03', version_code: 50020044, os: 'android', os_version: '12', install_ch: 'ps', device_id: randomBytes(16).toString('hex'), install_store: 'ps', gaid: crypto.randomUUID(), brand: 'Redmi', model: '2201117TG', system_language: 'en', net: 'NETWORK_WIFI', region: 'US', timezone: 'Europe/London', sp_code: '40401', 'X-Play-Mode': '2' });
+const MB_CERT_SHA256 = '03d4b741632d136bc23e2de4c6adcdb7712f1980b619c183221801730bbd0410';
+const _mbPick = a => a[Math.floor(Math.random() * a.length)];
+const MB_VC = _mbPick([50020117, 50020118, 50020119, 50020120, 50020121]);
+const _mbDev = _mbPick([['23078RKD5C', '13', 'TQ2A.230405.003'], ['2201117TY', '12', 'S1B.220414.015'], ['2201117TG', '12', 'S1B.220414.015'], ['22101316G', '13', 'TQ2A.230405.003'], ['21121210G', '11', 'RP1A.200720.011'], ['M2012K11AG', '12', 'S1B.220414.015'], ['M2007J20CG', '10', 'QP1A.191005.007.A3']]);
+const MB_UA = `com.community.oneroom/${MB_VC} (Linux; U; Android ${_mbDev[1]}; en_US; ${_mbDev[0]}; Build/${_mbDev[2]}; Cronet/135.0.7012.3)`;
+const MB_SPOOF_IP = `${_mbPick(['103.241', '49.36', '117.195', '106.198', '122.162', '157.32', '182.70', '103.58', '27.60', '59.90'])}.${1 + Math.floor(Math.random() * 253)}.${1 + Math.floor(Math.random() * 253)}`;
+const MB_CLIENT_INFO_OBJ = { package_name: 'com.community.oneroom', version_name: '4.0.01.0813.03', version_code: MB_VC, os: 'android', os_version: _mbDev[1], install_ch: 'ps', device_id: randomBytes(16).toString('hex'), install_store: 'ps', gaid: crypto.randomUUID(), brand: 'Redmi', model: _mbDev[0], system_language: 'en', net: 'NETWORK_WIFI', region: 'US', timezone: _mbPick(['Asia/Kolkata', 'Asia/Shanghai', 'Asia/Tokyo', 'America/New_York', 'Europe/London']), sp_code: '40401', 'X-Play-Mode': '2' };
 let mbToken = '';
 let mbBooted = false;
 
 function mbMd5(data) { return crypto.createHash('md5').update(data).digest('hex'); }
+
+// بصمة البناء: stamp = ثوانٍ + ميللي (3 خانات) + «000» + عشوائي، والهاش = md5(شهادة + oneroom + stamp)
+function mbBuildTag(ts) {
+    const stamp = String(Math.floor(ts / 1000)) + String(ts % 1000).padStart(3, '0') + '000' + String(Math.floor(Math.random() * 1000));
+    return stamp + '.' + mbMd5(MB_CERT_SHA256 + 'oneroom' + stamp);
+}
 
 function mbSortedQuery(url) {
     const u = new URL(url);
@@ -6362,6 +6814,7 @@ function mbHeaders(method, url, bodyStr, contentType) {
     const key = Buffer.from(MB_SECRET_DEFAULT + '='.repeat((4 - MB_SECRET_DEFAULT.length % 4) % 4), 'base64');
     const sig = crypto.createHmac('md5', key).update(canonical, 'utf-8').digest('base64');
     const reversed = String(ts).split('').reverse().join('');
+    const tag = mbBuildTag(ts);
     const headers = {
         'User-Agent': MB_UA,
         'Accept': accept,
@@ -6369,7 +6822,9 @@ function mbHeaders(method, url, bodyStr, contentType) {
         'Connection': 'keep-alive',
         'X-Client-Token': `${ts},${mbMd5(reversed)}`,
         'x-tr-signature': `${ts}|2|${sig}`,
-        'X-Client-Info': MB_CLIENT_INFO,
+        'X-Client-Info': JSON.stringify({ ...MB_CLIENT_INFO_OBJ, 'X-Client-Build': tag }),
+        'x-client-build': tag,
+        'x-forwarded-for': MB_SPOOF_IP,
         'X-Client-Status': '0'
     };
     if (mbToken) headers['Authorization'] = `Bearer ${mbToken}`;
@@ -6404,6 +6859,10 @@ async function mbRequest(method, pathAndQuery, bodyStr) {
 }
 
 async function mbBootstrap() {
+    try {
+        const data = await mbRequest('POST', '/wefeed-mobile-bff/user-api/visitor-login', '{}');
+        if (data && data.token) { mbToken = data.token; return; }
+    } catch (_) {}
     try { await mbRequest('GET', '/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version='); } catch (_) {}
 }
 
@@ -6424,6 +6883,46 @@ async function mbCall(method, pathAndQuery, bodyStr) {
 function mbQS(params) {
     return Object.entries(params).filter(([, v]) => v !== undefined && v !== null)
         .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join('&');
+}
+
+// روابط الإعلان الوهمي («حدّث التطبيق»): هاشات معروفة + أي ملف على macdn تحت /other/
+const MB_DUMMY_HASHES = ['80da52722ee7de7a4303290af6783424', '1c7de0bd3393702d9191801f15f88f8d', '9a0461bc39da389663bf3dbb17091d3f', 'b164fbfb4347792950bdfbfb563d39d9'];
+function mbIsDummyUrl(u) {
+    const s = String(u || '').toLowerCase();
+    if (!s) return true;
+    if (s.includes('/notice.mp4')) return true;
+    if (s.includes('macdn.aoneroom.com/other/')) return true;
+    return MB_DUMMY_HASHES.some(h => s.includes(h));
+}
+
+// معلومات بثّ DASH من الـ MPD نفسه: المدة + جودات الفيديو بترتيب ظهورها (لاختيار الجودة
+// عبر -map 0:v:N) + عرض نطاق الصوت — لتقدير حجم كل جودة: (عرض النطاق/8) × المدة
+async function mbDashInfo(mpdUrl, cookie) {
+    try {
+        const res = await axios.get(mpdUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0', ...(cookie ? { Cookie: cookie } : {}) },
+            timeout: 15000, responseType: 'text', validateStatus: s => s === 200
+        });
+        const mpd = String(res.data || '');
+        const dm = mpd.match(/mediaPresentationDuration="PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?"/);
+        let dur = 0;
+        if (dm) dur = (parseInt(dm[1] || '0', 10) * 3600) + (parseInt(dm[2] || '0', 10) * 60) + parseFloat(dm[3] || '0');
+        if (!dur) return null;
+        const reps = [];
+        let aBw = 0;
+        for (const blk of mpd.split(/<AdaptationSet/).slice(1)) {
+            const isAudio = /contentType="audio"|mimeType="audio\//.test(blk);
+            for (const m of blk.matchAll(/<Representation[^>]*>/g)) {
+                const bw = parseInt((m[0].match(/bandwidth="(\d+)"/) || [])[1] || '0', 10);
+                if (!bw) continue;
+                if (isAudio) { aBw = Math.max(aBw, bw); continue; }
+                const h = parseInt((m[0].match(/height="(\d+)"/) || [])[1] || '0', 10);
+                reps.push({ h, bw });
+            }
+        }
+        if (!reps.length) return null;
+        return { dur, reps, aBw };
+    } catch (_) { return null; }
 }
 
 // بحث MovieBox: subjectType 1=فيلم، 2=مسلسل — النتائج من أول مجموعة مواضيع
@@ -6472,23 +6971,50 @@ async function movieboxArabicSub(subjectId, resources) {
     return null;
 }
 
-// روابط MovieBox: من قائمة الموارد — ملفات MP4 مباشرة، الأفضل (الأكبر حجماً) لكل جودة، المجانية أولاً
+// روابط MovieBox: من play-info/v2 — بثّ DASH حقيقي (mpd على hakunaymatata) + signCookie
+// يُمرَّر كترويسة Cookie مع التحميل. الروابط الوهمية تُصفّى دائماً؛ غياب بثّ حقيقي = لا روابط.
 async function movieboxLinks(subjectId, se, ep) {
-    const data = await mbCall('GET', '/wefeed-mobile-bff/subject-api/resource?' + mbQS({ subjectId, se, ep, resolution: 0, page: 1, perPage: 20 }));
-    let list = ((data && data.list) || []).filter(r => r && r.resourceLink);
-    if (!list.length) return { links: [] };
-    const free = list.filter(r => !r.requireMemberType);
-    if (free.length) list = free;
-    const byRes = new Map();
-    for (const r of list) {
-        const res = parseInt(r.resolution) || 0;
-        const prev = byRes.get(res);
-        if (!prev || (parseInt(r.size) || 0) > (parseInt(prev.size) || 0)) byRes.set(res, r);
+    const params = { subjectId };
+    if (se > 0) { params.se = se; params.ep = ep; }
+    const data = await mbCall('GET', '/wefeed-mobile-bff/subject-api/play-info/v2?' + mbQS(params));
+    const streams = ((data && data.streams) || []).filter(s => s && s.url && !mbIsDummyUrl(s.url));
+    const links = [];
+    const seen = new Set();
+    for (const s of streams) {
+        if (seen.has(s.url)) continue;
+        seen.add(s.url);
+        const rm = String(s.url).match(/_(\d{3,4})[_.]/);
+        const res = rm ? parseInt(rm[1], 10) : 0;
+        const codec = /h265|hevc/i.test(s.url) ? ' HEVC' : '';
+        const cookie = s.signCookie || '';
+        const headers = cookie ? { Cookie: cookie } : {};
+        const info = await mbDashInfo(s.url, cookie);
+        if (info && info.reps.length > 1) {
+            // جودة لكل تمثيل في الـ MPD (بترتيبه) — التحميل يختاره عبر -map 0:v:N مع الصوت
+            info.reps.forEach((rep, k) => {
+                const est = Math.round(((rep.bw + info.aBw) / 8) * info.dur);
+                links.push({
+                    url: s.url,
+                    label: `MovieBox — ${rep.h ? rep.h + 'p' : (res ? res + 'p' : 'جودة ' + (k + 1))}${codec} — ~${fmtBytes(est)}`,
+                    headers, sizeDone: true, dashMap: `-map 0:v:${k} -map 0:a:0`
+                });
+            });
+        } else {
+            let label = `MovieBox — ${res ? res + 'p' : 'أفضل جودة'}${codec}`;
+            if (info && info.reps.length === 1) {
+                const est = Math.round(((info.reps[0].bw + info.aBw) / 8) * info.dur);
+                if (est > 0) label += ` — ~${fmtBytes(est)}`;
+            }
+            links.push({ url: s.url, label, headers, sizeDone: true });
+        }
     }
-    const picked = [...byRes.values()].sort((a, b) => (parseInt(b.resolution) || 0) - (parseInt(a.resolution) || 0));
-    const links = picked.map(r => ({ url: r.resourceLink, label: `MovieBox — ${r.resolution || '?'}p` }));
-    const probeOrder = list.slice().sort((a, b) => (parseInt(b.resolution) || 0) - (parseInt(a.resolution) || 0));
-    const subtitleUrl = await movieboxArabicSub(subjectId, probeOrder);
+    if (!links.length) return { links: [] };
+    let subtitleUrl = null;
+    try {
+        const rdata = await mbCall('GET', '/wefeed-mobile-bff/subject-api/resource?' + mbQS({ subjectId, se: se || 0, ep: ep || 0, resolution: 0, page: 1, perPage: 20 }));
+        const rlist = ((rdata && rdata.list) || []).filter(r => r && r.resourceId);
+        if (rlist.length) subtitleUrl = await movieboxArabicSub(subjectId, rlist);
+    } catch (_) {}
     return { links, subtitleUrl };
 }
 
@@ -7742,8 +8268,8 @@ async function startXeonBotInc() {
                                     await downloadVideoSmart(link.url, outPath, {
                                         'User-Agent': WEB_UA,
                                         'Referer': item.referer || cached.referer || 'https://akwam.ss/',
-                                        ...(cached.headers || {})
-                                    });
+                                        ...(cached.headers || {}), ...((link && link.headers) || {})
+                                    }, null, (link && link.dashMap) || null);
                                     if (item.subtitleUrl) outPath = await muxSubtitleIntoMp4(outPath, item.subtitleUrl);
                                     const finalSizeMB = (fs.statSync(outPath).size / 1024 / 1024).toFixed(2);
                                     await XeonBotInc.sendMessage(chatId, {
@@ -7814,7 +8340,7 @@ async function startXeonBotInc() {
                                 'User-Agent': WEB_UA,
                                 'Referer': (cached.referers && cached.referers[idx]) || cached.referer || 'https://akwam.ss/',
                                 ...((cached.headerSets && cached.headerSets[idx]) || cached.headers || {})
-                            }, footballOnProgress);
+                            }, footballOnProgress, (cached.dashSets && cached.dashSets[idx]) || null);
                             if (cached.subtitleUrl) outPath = await muxSubtitleIntoMp4(outPath, cached.subtitleUrl);
 
                             const finalSizeMB =
@@ -8352,6 +8878,22 @@ async function startXeonBotInc() {
                             await lfWizardNext(XeonBotInc, chatId, mek, job);
                             return;
                         }
+                        return;
+                    }
+
+                    // ── اختيار جودة خلاصات TikGon (للمصادر ذات الجودتين) ──
+                    if (redgifWizardCache.has(quotedId)) {
+                        const cached = redgifWizardCache.get(quotedId);
+                        const pick = String(replyText).trim().toLowerCase();
+                        let quality = null;
+                        if (pick === '1' || pick === 'hd') quality = 'hd';
+                        else if (pick === '2' || pick === 'sd') quality = 'sd';
+                        if (!quality) {
+                            await XeonBotInc.sendMessage(chatId, { text: '❌ رد برقم الجودة: 1 لـ HD أو 2 لـ SD.' }, { quoted: mek });
+                            return;
+                        }
+                        redgifWizardCache.delete(quotedId);
+                        await feedStartPump(XeonBotInc, chatId, mek, cached.source || 'redgif', cached.query, quality);
                         return;
                     }
 
@@ -9183,7 +9725,9 @@ async function startXeonBotInc() {
                                         names: resolved.links.map(r => r.label),
                                         title: selected.title,
                                         referer: (resolved.links[0] && resolved.links[0].referer) || '',
-                                        headers: selected.source === 'meowtv' ? { 'Origin': 'https://meowtv.ru' } : {},
+                                        headers: (resolved.links[0] && resolved.links[0].headers) || (selected.source === 'meowtv' ? { 'Origin': 'https://meowtv.ru' } : {}),
+                                        headerSets: resolved.links.map(r => r.headers || null),
+                                        dashSets: resolved.links.map(r => r.dashMap || null),
                                         subtitleUrl: resolved.subtitleUrl || null,
                                         timestamp: Date.now()
                                     });
@@ -9315,7 +9859,7 @@ async function startXeonBotInc() {
                                         names: batch[0].links.map(r => r.label),
                                         title: `${cachedData.title} - الحلقات ${start}-${end}`,
                                         referer: batch[0].referer,
-                                        headers: cachedData.source === 'meowtv' ? { 'Origin': 'https://meowtv.ru' } : {},
+                                        headers: (batch[0] && batch[0].links[0] && batch[0].links[0].headers) || (cachedData.source === 'meowtv' ? { 'Origin': 'https://meowtv.ru' } : {}),
                                         batch: batch.map(b => ({ number: b.number, links: b.links, referer: b.referer, subtitleUrl: b.subtitleUrl })),
                                         timestamp: Date.now()
                                     });
@@ -9349,7 +9893,9 @@ async function startXeonBotInc() {
                                     names: resolved.links.map(r => r.label),
                                     title: `${cachedData.title} - الحلقة ${ep.number}`,
                                     referer: (resolved.links[0] && resolved.links[0].referer) || '',
-                                    headers: cachedData.source === 'meowtv' ? { 'Origin': 'https://meowtv.ru' } : {},
+                                    headers: (resolved.links[0] && resolved.links[0].headers) || (cachedData.source === 'meowtv' ? { 'Origin': 'https://meowtv.ru' } : {}),
+                                    headerSets: resolved.links.map(r => r.headers || null),
+                                    dashSets: resolved.links.map(r => r.dashMap || null),
                                     subtitleUrl: resolved.subtitleUrl || null,
                                     timestamp: Date.now()
                                 });
@@ -9362,6 +9908,11 @@ async function startXeonBotInc() {
                             return;
                         }
                     }
+                }
+
+                // ── تحميل X التلقائي: أي رسالة غير أمر فيها رابط حالة X/تويتر ──
+                if (text && !text.trim().startsWith('.')) {
+                    autoXMaybeDownload(XeonBotInc, chatId, mek, text).catch(() => {});
                 }
 
                 // ============================================================
@@ -9419,6 +9970,11 @@ async function startXeonBotInc() {
                     text.startsWith('.tflix') ||
                     text.startsWith('.stoptflix') ||
                     text.startsWith('.settflix') ||
+                    text.startsWith('.redgif') ||
+                    text.startsWith('.stopredgif') ||
+                    text.startsWith('.erome') ||
+                    text.startsWith('.stoperome') ||
+                    text.startsWith('.stopfeed') ||
                     text.startsWith('.m3u') ||
                     text.startsWith('.record') ||
                     text.startsWith('.stoprecord') ||
@@ -9565,6 +10121,8 @@ async function startXeonBotInc() {
   ↳ \`.tflix <رابط صفحة مباراة tflix>\` للتسجيل من رابط مباشر — و \`.tflix [رقم] link\` لطباعة رابط MPD ومفتاح فك التشفير — و \`.stoptflix\` للإيقاف
   ↳ الدومين قابل للتبديل إن تغيّر عنوان الموقع: \`.tflix -domain <الدومين الجديد>\` (مثال: \`.tflix -domain tflix.su\`) — و \`.tflix -domain\` وحده يعرض الحالي
 
+• \`.redgif <بحث>\` — خلاصة فيديوهات RedGIFs (لتطبيق TikGon): أي كلمات بحث، يسألك عن الجودة مرة واحدة (HD/SD) ثم يضخّ الفيديوهات واحداً تلو الآخر بلا توقف — و\`.stopredgif\` للإيقاف
+• \`.erome <بحث>\` — خلاصة فيديوهات Erome (لتطبيق TikGon): أي كلمات بحث، يضخّ الفيديوهات واحداً تلو الآخر بلا توقف (بجودة الموقع نفسها، بلا سؤال جودة) — و\`.stoperome\` للإيقاف — و\`.stopfeed\` يوقف أي خلاصة جارية
 📱 *أدوات*
 • \`.apk <اسم>\` — ابحث وحمّل تطبيق APK
   ↳ مثال: \`.apk mt manager\`
@@ -10373,6 +10931,99 @@ async function startXeonBotInc() {
                         await XeonBotInc.sendMessage(chatId, {
                             text: `🛑 جاري إلغاء تسجيل tflix... سيتم إنهاء الجزء الحالي ثم التوقف.`
                         }, { quoted: mek });
+                        return;
+                    }
+
+                    // ── أمر .stopfeed — إيقاف أي خلاصة TikGon جارية في هذه المحادثة ──
+                    if (command === '.stopfeed') {
+                        const s = redgifSessions.get(chatId);
+                        if (s) {
+                            s.stopped = true;
+                            redgifSessions.delete(chatId);
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `🛑 *توقّفت الخلاصة.*\n📦 مجموع ما أُرسل: ${s.sent || 0} فيديو.`
+                            }, { quoted: mek });
+                        } else {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `ℹ️ لا توجد خلاصة جارية في هذه المحادثة.`
+                            }, { quoted: mek });
+                        }
+                        return;
+                    }
+
+                    // ── أمر .stopredgif — إيقاف خلاصة RedGIFs الجارية ──
+                    if (command === '.stopredgif') {
+                        const s = redgifSessions.get(chatId);
+                        if (s && (!s.source || s.source === 'redgif')) {
+                            s.stopped = true;
+                            redgifSessions.delete(chatId);
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `🛑 *توقّفت خلاصة RedGIFs.*\n📦 مجموع ما أُرسل: ${s.sent || 0} فيديو.`
+                            }, { quoted: mek });
+                        } else {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `ℹ️ لا توجد خلاصة RedGIFs جارية في هذه المحادثة.`
+                            }, { quoted: mek });
+                        }
+                        return;
+                    }
+
+                    // ── أمر .redgif — خلاصة RedGIFs لتطبيق TikGon ──
+                    // .redgif <بحث>        → يسأل عن الجودة مرة واحدة ثم يضخّ الفيديوهات بلا توقف
+                    // .redgif <بحث> hd|sd  → يبدأ فوراً بالجودة المكتوبة في آخر الأمر
+                    if (command === '.redgif') {
+                        let q = query.trim();
+                        if (!q) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `🔞 *خلاصة RedGIFs (TikGon)*\n\nالاستعمال: \`.redgif <كلمات البحث>\`\nمثال: \`.redgif asian ass\`\n\nيسألك البوت عن الجودة مرة واحدة (HD/SD) ثم يرسل الفيديوهات واحداً تلو الآخر بلا توقف.\n⚡ اختصار: أضف hd أو sd في آخر الأمر ليبدأ فوراً بلا سؤال.\n🛑 الإيقاف: \`.stopredgif\``
+                            }, { quoted: mek });
+                            return;
+                        }
+                        let quality = null;
+                        const qm = q.match(/\s+(hd|sd)$/i);
+                        if (qm) { quality = qm[1].toLowerCase(); q = q.slice(0, qm.index).trim(); }
+                        if (quality) {
+                            await redgifStartPump(XeonBotInc, chatId, mek, q, quality);
+                            return;
+                        }
+                        const sentQ = await XeonBotInc.sendMessage(chatId, {
+                            text: `🎞 *اختر جودة الخلاصة:*\n🔍 البحث: *${q}*\n\n*1.* HD — أعلى جودة (ملفات كبيرة: ~32 MB للفيديو)\n*2.* SD — خفيفة وسريعة (~5 MB — الأنسب لخلاصة سلسة بلا انتظار)\n\n💡 رد (Reply) على هذه الرسالة برقم الجودة خلال 5 دقائق — تُطبَّق على كل فيديوهات هذه الخلاصة.`
+                        }, { quoted: mek });
+                        redgifWizardCache.set(sentQ.key.id, { source: 'redgif', query: q });
+                        setTimeout(() => redgifWizardCache.delete(sentQ.key.id), 300000);
+                        return;
+                    }
+
+                    // ── أمر .stoperome — إيقاف خلاصة Erome الجارية ──
+                    if (command === '.stoperome') {
+                        const s = redgifSessions.get(chatId);
+                        if (s && s.source === 'erome') {
+                            s.stopped = true;
+                            redgifSessions.delete(chatId);
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `🛑 *توقّفت خلاصة Erome.*\n📦 مجموع ما أُرسل: ${s.sent || 0} فيديو.`
+                            }, { quoted: mek });
+                        } else {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `ℹ️ لا توجد خلاصة Erome جارية في هذه المحادثة.`
+                            }, { quoted: mek });
+                        }
+                        return;
+                    }
+
+                    // ── أمر .erome — خلاصة Erome لتطبيق TikGon (جودة واحدة كما في الموقع — بلا سؤال جودة) ──
+                    // .erome <بحث>  → يبدأ فوراً ويضخّ الفيديوهات بلا توقف
+                    if (command === '.erome') {
+                        let q = query.trim();
+                        const qm = q.match(/\s+(hd|sd)$/i);
+                        if (qm) q = q.slice(0, qm.index).trim();
+                        if (!q) {
+                            await XeonBotInc.sendMessage(chatId, {
+                                text: `🔞 *خلاصة Erome (TikGon)*\n\nالاستعمال: \`.erome <كلمات البحث>\`\nمثال: \`.erome dance\`\n\nيرسل البوت الفيديوهات واحداً تلو الآخر بلا توقف (بجودة الموقع نفسها — بلا سؤال جودة).\n🛑 الإيقاف: \`.stoperome\` أو \`.stopfeed\``
+                            }, { quoted: mek });
+                            return;
+                        }
+                        await feedStartPump(XeonBotInc, chatId, mek, 'erome', q, null);
                         return;
                     }
 
